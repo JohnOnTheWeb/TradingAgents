@@ -149,6 +149,11 @@ class TradingAgentsGraph:
             if effort:
                 kwargs["effort"] = effort
 
+        elif provider == "bedrock":
+            effort = self.config.get("anthropic_effort")
+            if effort:
+                kwargs["effort"] = effort
+
         return kwargs
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
