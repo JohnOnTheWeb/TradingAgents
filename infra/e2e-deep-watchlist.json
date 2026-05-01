@@ -1,0 +1,22 @@
+{
+  "date": "today",
+  "deep_model": "us.anthropic.claude-opus-4-7",
+  "quick_model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+  "tickers": [
+    {
+      "symbol": "AMZN",
+      "analysts": ["market", "social", "news", "fundamentals"],
+      "debate_rounds": 2
+    },
+    {
+      "symbol": "AMD",
+      "analysts": ["market", "social", "news", "fundamentals"],
+      "debate_rounds": 2
+    },
+    {
+      "symbol": "WDC",
+      "analysts": ["market", "social", "news", "fundamentals"],
+      "debate_rounds": 2
+    }
+  ]
+}
