@@ -1,19 +1,24 @@
 """Step 3 of the state machine: aggregate per-ticker results → summary report.
 
+With the invoke step running on Fargate instead of a Lambda, we can't
+collect per-ticker results via Map output (Fargate tasks don't return
+payload). Instead every Fargate task writes its result JSON to
+``s3://<TA_CONFIG_BUCKET>/runs/<run_id>/<TICKER>.json`` and this
+aggregator reads them by listing the prefix.
+
 Input:
     {
         "run_id": "<uuid>",
         "trade_date": "2026-04-30",
-        "results": [ /* one entry per ticker from invoke_agent */ ]
+        "tickers": [{"symbol": "AMZN", ...}, ...],
+        "config_bucket": "ta-config-<account>"
     }
 
-Output: summary stats the notify step reads.
-
 Environment:
-    MD_STORE_ENDPOINT        — md-store MCP endpoint URL
-    MD_STORE_SECRET_ID       — Secrets Manager id holding the bearer token
-    MD_STORE_AGENT_ID        — agent id header value (default tauric-traders)
-    SNS_NOTIFICATIONS_TOPIC  — success-notification SNS topic ARN
+    MD_STORE_ENDPOINT        md-store MCP endpoint URL
+    MD_STORE_SECRET_ID       Secrets Manager id holding the bearer token
+    MD_STORE_AGENT_ID        agent id header (default tauric-traders)
+    SNS_NOTIFICATIONS_TOPIC  success-notification SNS topic ARN
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _sns = boto3.client("sns")
 _secrets = boto3.client("secretsmanager")
+_s3 = boto3.client("s3")
 
 _cached_bearer: Optional[str] = None
 
@@ -93,6 +99,37 @@ def _fmt_usd(value: float) -> str:
     return f"${value:,.4f}"
 
 
+def _load_ticker_result(
+    bucket: str, run_id: str, ticker: str
+) -> Dict[str, Any]:
+    key = f"runs/{run_id}/{ticker}.json"
+    try:
+        obj = _s3.get_object(Bucket=bucket, Key=key)
+    except _s3.exceptions.NoSuchKey:
+        return {
+            "ticker": ticker,
+            "run_id": run_id,
+            "status": "task_no_output",
+            "error": (
+                f"Fargate task for {ticker} did not write s3://{bucket}/{key}"
+            ),
+            "cost_usd": 0.0,
+            "token_usage": [],
+        }
+    body = obj["Body"].read().decode("utf-8")
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as err:
+        return {
+            "ticker": ticker,
+            "run_id": run_id,
+            "status": "result_parse_failed",
+            "error": f"{type(err).__name__}: {err}",
+            "cost_usd": 0.0,
+            "token_usage": [],
+        }
+
+
 def _render_summary(
     trade_date: str, run_id: str, results: Iterable[Dict[str, Any]]
 ) -> str:
@@ -141,7 +178,22 @@ def _render_summary(
 def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
     trade_date = event["trade_date"]
     run_id = event["run_id"]
-    results: List[Dict[str, Any]] = list(event.get("results") or [])
+    bucket = event.get("config_bucket") or os.environ.get("TRADINGAGENTS_CONFIG_BUCKET")
+    if not bucket:
+        raise ValueError(
+            "Aggregate input missing config_bucket and "
+            "TRADINGAGENTS_CONFIG_BUCKET env var not set"
+        )
+    tickers_raw = event.get("tickers") or []
+
+    tickers: List[str] = []
+    for t in tickers_raw:
+        if isinstance(t, str):
+            tickers.append(t.upper())
+        elif isinstance(t, dict) and t.get("symbol"):
+            tickers.append(str(t["symbol"]).upper())
+
+    results = [_load_ticker_result(bucket, run_id, t) for t in tickers]
     total_cost = round(sum(float(r.get("cost_usd", 0.0) or 0.0) for r in results), 4)
     successes = sum(1 for r in results if r.get("status") == "success")
     failures = len(results) - successes
@@ -149,7 +201,6 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
     summary_key = f"TauricTraders/_summary_{trade_date}.md"
     _write_md_store(summary_key, _render_summary(trade_date, run_id, results))
 
-    # SNS success message — contains markdown-friendly list of reports.
     topic = os.environ.get("SNS_NOTIFICATIONS_TOPIC")
     if topic:
         report_lines = [
@@ -169,7 +220,7 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
         subject = (
             f"TradingAgents run complete — {trade_date} — "
             f"{successes}/{len(results)} ok, {_fmt_usd(total_cost)}"
-        )[:100]  # SNS email subject limit
+        )[:100]
         _sns.publish(TopicArn=topic, Subject=subject, Message=body)
 
     return {

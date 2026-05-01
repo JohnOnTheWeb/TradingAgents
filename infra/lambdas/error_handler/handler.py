@@ -1,14 +1,9 @@
 """Error-handler Lambda: publishes SNS alert when any Step Functions state fails.
 
-Invoked from every Catch block in the state machine. Input looks like:
-
-    {
-        "run_id":     "<uuid>" (when available),
-        "trade_date": "2026-04-30" (when available),
-        "stage":      "invoke_agent" | "get_config" | "aggregate",
-        "ticker":     "NVDA" (if applicable),
-        "error":      { "Error": "...", "Cause": "..." }  (Step Functions error shape)
-    }
+Invoked from every Catch block in the state machine. Step Functions
+doesn't guarantee that $$.Execution.Input has run_id / trade_date (the
+schedule only passes config_key), so the caller supplies what it knows
+via the Catch payload.
 """
 
 from __future__ import annotations
@@ -25,13 +20,13 @@ _sns = boto3.client("sns")
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     topic = os.environ["SNS_NOTIFICATIONS_TOPIC"]
     stage = event.get("stage", "unknown")
-    ticker = event.get("ticker")
-    run_id = event.get("run_id", "unknown")
-    trade_date = event.get("trade_date", "unknown")
+    ticker = event.get("ticker") or "(all)"
+    run_id = event.get("run_id") or "unknown"
+    trade_date = event.get("trade_date") or "unknown"
     err = event.get("error") or {}
 
-    err_name = err.get("Error", "UnknownError")
-    cause_raw = err.get("Cause", "")
+    err_name = err.get("Error", "UnknownError") if isinstance(err, dict) else "UnknownError"
+    cause_raw = err.get("Cause", "") if isinstance(err, dict) else str(err)
     try:
         cause = json.loads(cause_raw)
     except (TypeError, json.JSONDecodeError):
@@ -42,7 +37,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if log_group and context is not None:
         region = os.environ.get("AWS_REGION", "us-east-1")
         stream = getattr(context, "log_stream_name", "")
-        # CloudWatch Logs console deep-link
         log_link = (
             f"https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}"
             f"#logsV2:log-groups/log-group/"
@@ -50,12 +44,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             f"/log-events/{stream.replace('/', '$252F')}"
         )
 
-    subject = f"TradingAgents FAILED — {stage} — {ticker or run_id}"[:100]
+    subject = f"TradingAgents FAILED — {stage} — {ticker}"[:100]
     lines = [
         f"TradingAgents run {run_id} failed at stage: {stage}",
         f"Date: {trade_date}",
     ]
-    if ticker:
+    if ticker and ticker != "(all)":
         lines.append(f"Ticker: {ticker}")
     lines += [
         "",

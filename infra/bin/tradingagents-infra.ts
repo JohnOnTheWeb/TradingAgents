@@ -78,4 +78,14 @@ NagSuppressions.addStackSuppressions(stack, [
     reason:
       "SQS DLQ is only written by the EventBridge Scheduler service role in this account; no cross-account or external producers exist that would benefit from TLS enforcement.",
   },
+  {
+    id: "AwsSolutions-ECS4",
+    reason:
+      "Container Insights is intentionally disabled for cost control; per-task CloudWatch Logs + task metrics are sufficient for this batch workload (one task per ticker per day).",
+  },
+  {
+    id: "AwsSolutions-ECS2",
+    reason:
+      "Task env vars hold only non-sensitive resource names (S3 bucket, DynamoDB table, ECR tag). Per-run secrets (AgentCore runtime ARN, ticker, date) arrive via Step Functions containerOverrides, not hardcoded in the task definition.",
+  },
 ]);

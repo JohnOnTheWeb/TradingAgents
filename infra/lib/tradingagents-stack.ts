@@ -3,7 +3,9 @@ import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr from "aws-cdk-lib/aws-ecr";
+import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
@@ -161,25 +163,9 @@ export class TradingAgentsStack extends cdk.Stack {
     });
     configBucket.grantRead(getConfigFn);
 
-    const invokeAgentFn = new lambda.Function(this, "InvokeAgentFn", {
-      functionName: "ta-invoke-agent",
-      runtime: pythonRuntime,
-      handler: "handler.handler",
-      code: lambda.Code.fromAsset(path.join(LAMBDA_DIR, "invoke_agent")),
-      timeout: cdk.Duration.minutes(15),
-      memorySize: 512,
-      environment: {
-        // AGENTCORE_RUNTIME_ARN is set below once the runtime resource exists.
-        AGENTCORE_TIMEOUT: "900",
-      },
-      logRetention: logs.RetentionDays.ONE_MONTH,
-    });
-    invokeAgentFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["bedrock-agentcore:InvokeAgentRuntime"],
-        resources: ["*"],
-      }),
-    );
+    // NOTE: The old ta-invoke-agent Lambda has been replaced by an ECS
+    // Fargate task (see TaskRunner below). Lambda's 15-min hard cap made
+    // long deep-research runs impossible; Fargate has no such limit.
 
     const aggregateFn = new lambda.Function(this, "AggregateFn", {
       functionName: "ta-aggregate",
@@ -192,11 +178,14 @@ export class TradingAgentsStack extends cdk.Stack {
         MD_STORE_SECRET_ID: mdStoreSecret.secretName,
         MD_STORE_AGENT_ID: "tauric-traders",
         SNS_NOTIFICATIONS_TOPIC: notificationsTopic.topicArn,
+        TRADINGAGENTS_CONFIG_BUCKET: configBucket.bucketName,
       },
       logRetention: logs.RetentionDays.ONE_MONTH,
     });
     mdStoreSecret.grantRead(aggregateFn);
     notificationsTopic.grantPublish(aggregateFn);
+    // Aggregator reads per-ticker result JSONs written by Fargate tasks.
+    configBucket.grantRead(aggregateFn);
 
     const errorHandlerFn = new lambda.Function(this, "ErrorHandlerFn", {
       functionName: "ta-error-handler",
@@ -363,17 +352,8 @@ export class TradingAgentsStack extends cdk.Stack {
       });
 
       // Feed the runtime ARN into the invoker Lambda env.
-      // The CFN docs say Ref returns the ARN, but in practice Ref returns the
-      // shorter "<name>-<hash>" identifier. Fn::GetAtt on AgentRuntimeArn
-      // produces the full ARN that bedrock-agentcore:InvokeAgentRuntime needs.
-      const runtimeArn = cdk.Fn.getAtt(
-        agentRuntime.logicalId,
-        "AgentRuntimeArn",
-      ).toString();
-      (invokeAgentFn.node.defaultChild as lambda.CfnFunction).addPropertyOverride(
-        "Environment.Variables.AGENTCORE_RUNTIME_ARN",
-        runtimeArn,
-      );
+      // Note: the runtime ARN is consumed by the Fargate task (see
+      // TaskRunnerTaskDef below) via containerOverrides, not a Lambda env.
     }
 
     // --- Gateway ------------------------------------------------------
@@ -568,6 +548,93 @@ export class TradingAgentsStack extends cdk.Stack {
     }
 
     // ------------------------------------------------------------------
+    // ECS Fargate — per-ticker invoker replaces the old ta-invoke-agent
+    // Lambda (which was boxed in by Lambda's 15-min hard cap).
+    //
+    // The task reuses the same ECR image; Step Functions overrides the
+    // container CMD with `python -m tradingagents.agentcore.task_runner`
+    // and injects per-ticker env vars.
+    // ------------------------------------------------------------------
+
+    let ecsCluster: ecs.Cluster | undefined;
+    let taskDef: ecs.FargateTaskDefinition | undefined;
+    let taskSecurityGroup: ec2.SecurityGroup | undefined;
+    let taskVpc: ec2.IVpc | undefined;
+    let agentRuntimeArnValue: string | undefined;
+
+    if (agentCoreEnabled && agentRuntime) {
+      taskVpc = ec2.Vpc.fromLookup(this, "DefaultVpc", { isDefault: true });
+
+      ecsCluster = new ecs.Cluster(this, "TaskCluster", {
+        clusterName: "tradingagents-tasks",
+        vpc: taskVpc,
+        containerInsightsV2: ecs.ContainerInsights.DISABLED,
+      });
+
+      const taskLogGroup = new logs.LogGroup(this, "TaskRunnerLogs", {
+        logGroupName: "/aws/ecs/tradingagents-tasks",
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+
+      taskDef = new ecs.FargateTaskDefinition(this, "TaskRunnerTaskDef", {
+        family: "tradingagents-task-runner",
+        cpu: 1024,
+        memoryLimitMiB: 2048,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.ARM64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
+      });
+
+      taskDef.addContainer("TaskRunner", {
+        containerName: "task-runner",
+        image: ecs.ContainerImage.fromEcrRepository(ecrRepo, "latest"),
+        // Override the image's uvicorn CMD so this container runs the
+        // Fargate invoker instead of the AgentCore FastAPI server.
+        entryPoint: ["python", "-m"],
+        command: ["tradingagents.agentcore.task_runner"],
+        workingDirectory: "/home/appuser/app",
+        logging: ecs.LogDrivers.awsLogs({
+          logGroup: taskLogGroup,
+          streamPrefix: "task",
+        }),
+        // TA_* env vars are supplied per-run via containerOverrides on the
+        // RunTask call; only the constants live here.
+        environment: {
+          TA_CONFIG_BUCKET: configBucket.bucketName,
+          TA_RESULT_KEY_PREFIX: "runs/",
+          AGENTCORE_TIMEOUT: "3600",
+          TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
+          TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
+        },
+      });
+
+      // Task role (application permissions): invoke AgentCore Runtime + write S3 results.
+      taskDef.taskRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+          resources: ["*"],
+        }),
+      );
+      configBucket.grantReadWrite(taskDef.taskRole);
+
+      // Security group — egress-only, no inbound.
+      taskSecurityGroup = new ec2.SecurityGroup(this, "TaskSg", {
+        vpc: taskVpc,
+        securityGroupName: "tradingagents-task-sg",
+        description: "Egress-only SG for TradingAgents Fargate tasks",
+        allowAllOutbound: true,
+      });
+
+      // Full AgentCore runtime ARN — passed per-run to the container.
+      agentRuntimeArnValue = cdk.Fn.getAtt(
+        agentRuntime.logicalId,
+        "AgentRuntimeArn",
+      ).toString();
+    }
+
+    // ------------------------------------------------------------------
     // Step Functions state machine
     // ------------------------------------------------------------------
 
@@ -578,8 +645,10 @@ export class TradingAgentsStack extends cdk.Stack {
         lambdaFunction: errorHandlerFn,
         payload: sfn.TaskInput.fromObject({
           stage,
-          "run_id.$": "$$.Execution.Input.run_id",
-          "trade_date.$": "$$.Execution.Input.trade_date",
+          // The schedule input is {config_key}, not {run_id}/{trade_date},
+          // so don't try to read those fields from $$.Execution.Input —
+          // the values live on the current state's input after GetConfig.
+          "run_id.$": "States.JsonToString($)",
           "ticker.$": "$.ticker",
           "error.$": "$.error",
         }),
@@ -602,28 +671,60 @@ export class TradingAgentsStack extends cdk.Stack {
       resultPath: "$.error",
     });
 
-    const invokeAgentTask = new tasks.LambdaInvoke(this, "InvokeAgentTask", {
-      lambdaFunction: invokeAgentFn,
-      payload: sfn.TaskInput.fromObject({
-        "run_id.$": "$.run_id",
-        "trade_date.$": "$.trade_date",
-        "deep_model.$": "$.deep_model",
-        "quick_model.$": "$.quick_model",
-        "ticker.$": "$.ticker",
-      }),
-      outputPath: "$.Payload",
-    });
-    invokeAgentTask.addRetry({
-      errors: [
-        "Lambda.ServiceException",
-        "Lambda.AWSLambdaException",
-        "Lambda.SdkClientException",
-        "States.TaskFailed",
-      ],
-      interval: cdk.Duration.seconds(10),
-      maxAttempts: 2,
-      backoffRate: 2,
-    });
+    // ------------------------------------------------------------------
+    // Per-ticker Fargate run (inside the Map)
+    // ------------------------------------------------------------------
+    //
+    // The Map iterates the expanded tickers array from GetConfig. For each
+    // ticker we RunTask on Fargate with per-ticker env vars. The task
+    // writes its result to s3://config_bucket/runs/<run_id>/<ticker>.json;
+    // Map output is intentionally minimal because the aggregator reads
+    // those S3 objects directly.
+
+    // Build a concrete per-ticker run only when Fargate is available.
+    // When agentCoreEnabled=false, the state machine short-circuits to
+    // the aggregator with an empty ticker list so the stack still syncs.
+    const perTickerRun =
+      agentCoreEnabled && ecsCluster && taskDef && taskSecurityGroup && agentRuntimeArnValue
+        ? new tasks.EcsRunTask(this, "RunTickerOnFargate", {
+            cluster: ecsCluster,
+            taskDefinition: taskDef,
+            launchTarget: new tasks.EcsFargateLaunchTarget({
+              platformVersion: ecs.FargatePlatformVersion.LATEST,
+            }),
+            assignPublicIp: true,
+            subnets: { subnetType: ec2.SubnetType.PUBLIC },
+            securityGroups: [taskSecurityGroup],
+            integrationPattern: sfn.IntegrationPattern.RUN_JOB,
+            containerOverrides: [
+              {
+                containerDefinition: taskDef.defaultContainer!,
+                environment: [
+                  { name: "TA_RUN_ID", value: sfn.JsonPath.stringAt("$.run_id") },
+                  { name: "TA_TICKER", value: sfn.JsonPath.stringAt("$.ticker.symbol") },
+                  { name: "TA_TRADE_DATE", value: sfn.JsonPath.stringAt("$.trade_date") },
+                  { name: "AGENTCORE_RUNTIME_ARN", value: agentRuntimeArnValue },
+                  {
+                    name: "TA_ANALYSTS",
+                    value: sfn.JsonPath.jsonToString(
+                      sfn.JsonPath.objectAt("$.ticker.analysts"),
+                    ),
+                  },
+                  {
+                    name: "TA_DEBATE_ROUNDS",
+                    value: sfn.JsonPath.format(
+                      "{}",
+                      sfn.JsonPath.stringAt("$.ticker.debate_rounds"),
+                    ),
+                  },
+                  { name: "TA_DEEP_MODEL", value: sfn.JsonPath.stringAt("$.deep_model") },
+                  { name: "TA_QUICK_MODEL", value: sfn.JsonPath.stringAt("$.quick_model") },
+                ],
+              },
+            ],
+            resultPath: sfn.JsonPath.DISCARD,
+          })
+        : null;
 
     const tickerMap = new sfn.Map(this, "PerTickerMap", {
       maxConcurrency: 3,
@@ -635,11 +736,22 @@ export class TradingAgentsStack extends cdk.Stack {
         "quick_model.$": "$.config.quick_model",
         "ticker.$": "$$.Map.Item.Value",
       },
-      resultPath: "$.results",
+      // Per-iteration output discarded; aggregator reads results from S3.
+      resultPath: sfn.JsonPath.DISCARD,
     });
-    tickerMap.itemProcessor(invokeAgentTask);
+    if (perTickerRun) {
+      tickerMap.itemProcessor(perTickerRun);
+    } else {
+      // Agent not yet enabled (phase-1 deploy). Give the Map a no-op item
+      // processor so cdk synth succeeds; the state machine isn't meant to
+      // be invoked until phase-2.
+      tickerMap.itemProcessor(new sfn.Pass(this, "NoopTickerPass"));
+    }
+    // Map-level catch: route to the notifier if the Map state itself
+    // explodes (e.g. invalid items). Per-ticker failures are tolerated by
+    // the Fargate task (it writes a failure JSON to S3 and exits non-zero).
     tickerMap.addCatch(buildErrorBranch("invoke_agent_map"), {
-      resultPath: "$.error",
+      resultPath: sfn.JsonPath.DISCARD,
     });
 
     const aggregateTask = new tasks.LambdaInvoke(this, "AggregateTask", {
@@ -647,7 +759,8 @@ export class TradingAgentsStack extends cdk.Stack {
       payload: sfn.TaskInput.fromObject({
         "run_id.$": "$.config.run_id",
         "trade_date.$": "$.config.trade_date",
-        "results.$": "$.results",
+        "tickers.$": "$.config.tickers",
+        "config_bucket": configBucket.bucketName,
       }),
       outputPath: "$.Payload",
     });
