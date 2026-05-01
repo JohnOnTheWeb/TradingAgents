@@ -65,24 +65,9 @@ export class TradingAgentsStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    // Bucket CodeBuild writes Lambda zips to. Versioned so every rebuild
-    // produces a new object version; the Lambdas below reference the
-    // current version, and we update them via a follow-up `cdk deploy`
-    // (or `aws lambda update-function-code` hook in the buildspec).
-    const buildArtifactsBucket = new s3.Bucket(this, "BuildArtifactsBucket", {
-      bucketName: `ta-build-artifacts-${this.account}`,
-      versioned: true,
-      encryption: s3.BucketEncryption.S3_MANAGED,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      enforceSSL: true,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-      lifecycleRules: [
-        {
-          // Keep the current version indefinitely; expire old versions after 30 days.
-          noncurrentVersionExpiration: cdk.Duration.days(30),
-        },
-      ],
-    });
+    // (No build-artifacts bucket needed — Gateway Lambdas run as ECR
+    // container images sharing the AgentCore Runtime's image, so CodeBuild
+    // only produces one artifact: the ECR tag.)
 
     const mdStoreSecret = new secretsmanager.Secret(this, "MdStoreBearer", {
       secretName: "tradingagents/md-store-bearer",
@@ -126,9 +111,6 @@ export class TradingAgentsStack extends cdk.Stack {
         AWS_ACCOUNT_ID: { value: this.account },
         AWS_REGION: { value: this.region },
         ECR_REPOSITORY: { value: ecrRepo.repositoryName },
-        BUILD_ARTIFACTS_BUCKET: { value: buildArtifactsBucket.bucketName },
-        DATA_TOOLS_FN_NAME: { value: "ta-mcp-data-tools" },
-        MEMORY_LOG_FN_NAME: { value: "ta-mcp-memory-log" },
       },
       logging: {
         cloudWatch: {
@@ -140,18 +122,6 @@ export class TradingAgentsStack extends cdk.Stack {
       },
     });
     ecrRepo.grantPullPush(codebuildProject);
-    buildArtifactsBucket.grantReadWrite(codebuildProject);
-    // CodeBuild updates the Lambda code inline after each build so we don't
-    // need a second `cdk deploy` just to pick up a new zip.
-    codebuildProject.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["lambda:UpdateFunctionCode"],
-        resources: [
-          `arn:aws:lambda:${this.region}:${this.account}:function:ta-mcp-data-tools`,
-          `arn:aws:lambda:${this.region}:${this.account}:function:ta-mcp-memory-log`,
-        ],
-      }),
-    );
 
     // ------------------------------------------------------------------
     // Notification plumbing
@@ -245,40 +215,60 @@ export class TradingAgentsStack extends cdk.Stack {
 
     // --- Gateway-target Lambdas (bundled with tradingagents package) --
 
-    // Gateway-target Lambdas: code zips are produced by CodeBuild and
-    // uploaded to the build-artifacts bucket. The first deploy uses the
-    // placeholder zip shipped under infra/lambdas/_bootstrap/ so the
-    // resources can be created before CodeBuild has run; CodeBuild then
-    // swaps in the real package via `aws lambda update-function-code`.
-    const dataToolsFn = new lambda.Function(this, "DataToolsFn", {
-      functionName: "ta-mcp-data-tools",
-      runtime: pythonRuntime,
-      handler: "handler.handler",
-      code: lambda.Code.fromAsset(path.join(LAMBDA_DIR, "_bootstrap")),
-      timeout: cdk.Duration.minutes(2),
-      memorySize: 1024,
-      environment: {
-        TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
-        TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
-      },
-      logRetention: logs.RetentionDays.ONE_MONTH,
-    });
-    buildArtifactsBucket.grantRead(dataToolsFn);
+    // Gateway-target Lambdas are container images pulled from the same
+    // ECR repo as the AgentCore Runtime. The container image supports up
+    // to 10 GB, avoiding the 250 MB unzipped zip limit that pandas +
+    // yfinance would blow past. Because the image has to exist before
+    // these Lambdas can be created, we gate them (and the downstream
+    // Gateway + targets) behind the same `agentCoreEnabled` context flag.
+    let dataToolsFn: lambda.DockerImageFunction | undefined;
+    let memoryLogFn: lambda.DockerImageFunction | undefined;
 
-    const memoryLogFn = new lambda.Function(this, "MemoryLogFn", {
-      functionName: "ta-mcp-memory-log",
-      runtime: pythonRuntime,
-      handler: "handler.handler",
-      code: lambda.Code.fromAsset(path.join(LAMBDA_DIR, "_bootstrap")),
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 512,
-      environment: {
-        TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
-      },
-      logRetention: logs.RetentionDays.ONE_MONTH,
-    });
-    buildArtifactsBucket.grantRead(memoryLogFn);
-    memoryTable.grantReadWriteData(memoryLogFn);
+    if (agentCoreEnabled) {
+      dataToolsFn = new lambda.DockerImageFunction(this, "DataToolsFn", {
+        functionName: "ta-mcp-data-tools",
+        code: lambda.DockerImageCode.fromEcr(ecrRepo, {
+          tagOrDigest: "latest",
+          cmd: ["handler.handler"],
+          entrypoint: [
+            "/usr/local/bin/python",
+            "-m",
+            "awslambdaric",
+          ],
+          workingDirectory: "/home/appuser/app/infra/lambdas/data_tools",
+        }),
+        architecture: lambda.Architecture.ARM_64,
+        timeout: cdk.Duration.minutes(2),
+        memorySize: 1024,
+        environment: {
+          TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
+          TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
+        },
+        logRetention: logs.RetentionDays.ONE_MONTH,
+      });
+
+      memoryLogFn = new lambda.DockerImageFunction(this, "MemoryLogFn", {
+        functionName: "ta-mcp-memory-log",
+        code: lambda.DockerImageCode.fromEcr(ecrRepo, {
+          tagOrDigest: "latest",
+          cmd: ["handler.handler"],
+          entrypoint: [
+            "/usr/local/bin/python",
+            "-m",
+            "awslambdaric",
+          ],
+          workingDirectory: "/home/appuser/app/infra/lambdas/memory_log",
+        }),
+        architecture: lambda.Architecture.ARM_64,
+        timeout: cdk.Duration.seconds(30),
+        memorySize: 512,
+        environment: {
+          TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
+        },
+        logRetention: logs.RetentionDays.ONE_MONTH,
+      });
+      memoryTable.grantReadWriteData(memoryLogFn);
+    }
 
     // ------------------------------------------------------------------
     // AgentCore Runtime + Gateway + Targets (raw CFN; no L2 construct yet)
@@ -383,10 +373,11 @@ export class TradingAgentsStack extends cdk.Stack {
       description:
         "Service role that AgentCore Gateway uses to invoke MCP target Lambdas",
     });
-    dataToolsFn.grantInvoke(gatewayRole);
-    memoryLogFn.grantInvoke(gatewayRole);
 
-    if (agentCoreEnabled) {
+    if (agentCoreEnabled && dataToolsFn && memoryLogFn) {
+      dataToolsFn.grantInvoke(gatewayRole);
+      memoryLogFn.grantInvoke(gatewayRole);
+
       gateway = new cdk.CfnResource(this, "AgentCoreGateway", {
         type: "AWS::BedrockAgentCore::Gateway",
         properties: {
@@ -596,9 +587,6 @@ export class TradingAgentsStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "EcrRepoUriOut", { value: ecrRepo.repositoryUri });
     new cdk.CfnOutput(this, "ConfigBucketOut", { value: configBucket.bucketName });
-    new cdk.CfnOutput(this, "BuildArtifactsBucketOut", {
-      value: buildArtifactsBucket.bucketName,
-    });
     new cdk.CfnOutput(this, "MemoryTableOut", { value: memoryTable.tableName });
     new cdk.CfnOutput(this, "NotificationsTopicOut", {
       value: notificationsTopic.topicArn,

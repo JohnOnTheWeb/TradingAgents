@@ -1,15 +1,14 @@
 # CodeBuild buildspec for tradingagents-build.
 #
-# Required environment variables (set on the CodeBuild project by CDK):
-#   AWS_ACCOUNT_ID           account number for the ECR URI
-#   AWS_REGION               ECR + Lambda region
-#   ECR_REPOSITORY           ECR repo name (tradingagents-agentcore)
-#   BUILD_ARTIFACTS_BUCKET   S3 bucket where Lambda zips are uploaded
-#   DATA_TOOLS_FN_NAME       Lambda function name for the data-tools MCP target
-#   MEMORY_LOG_FN_NAME       Lambda function name for the memory-log MCP target
+# Builds the ARM64 container image and pushes it to ECR. The same image
+# serves three consumers: the AgentCore Runtime (uvicorn entrypoint),
+# the data-tools Lambda (awslambdaric + infra/lambdas/data_tools),
+# and the memory-log Lambda (awslambdaric + infra/lambdas/memory_log).
 #
-# AgentCore Runtime requires linux/arm64 images, so the project runs on an
-# ARM64 build image with privileged mode enabled for docker buildx.
+# Required environment variables (set on the CodeBuild project by CDK):
+#   AWS_ACCOUNT_ID   account number for the ECR URI
+#   AWS_REGION       ECR region
+#   ECR_REPOSITORY   ECR repo name (tradingagents-agentcore)
 
 version: 0.2
 
@@ -19,13 +18,6 @@ env:
     IMAGE_PLATFORM: "linux/arm64"
 
 phases:
-  install:
-    runtime-versions:
-      python: 3.12
-    commands:
-      - python --version
-      - pip install --upgrade pip
-
   pre_build:
     commands:
       - echo "CodeBuild started on $(date -u +%FT%TZ)"
@@ -38,7 +30,6 @@ phases:
 
   build:
     commands:
-      # --- Step 1: agent container image ------------------------------------
       - docker buildx create --use --name tabuilder 2>/dev/null || docker buildx use tabuilder
       - docker buildx inspect --bootstrap
       - docker buildx build
@@ -50,48 +41,10 @@ phases:
           --push
           .
 
-      # --- Step 2: Gateway-target Lambda zips --------------------------------
-      # Both Lambdas need the tradingagents package on their PYTHONPATH.
-      # pip-install once, then build a zip per handler directory on top of
-      # the shared layer contents.
-      - echo "Building Lambda zips"
-      - mkdir -p lambda_build/shared
-      - pip install . --target lambda_build/shared
-
-      - echo "Packaging data-tools Lambda"
-      - rm -rf lambda_build/data_tools
-      - cp -r lambda_build/shared lambda_build/data_tools
-      - cp infra/lambdas/data_tools/*.py lambda_build/data_tools/
-      - (cd lambda_build/data_tools && zip -qr ../data-tools.zip .)
-
-      - echo "Packaging memory-log Lambda"
-      - rm -rf lambda_build/memory_log
-      - cp -r lambda_build/shared lambda_build/memory_log
-      - cp infra/lambdas/memory_log/*.py lambda_build/memory_log/
-      - (cd lambda_build/memory_log && zip -qr ../memory-log.zip .)
-
   post_build:
     commands:
-      - echo "Uploading Lambda zips to s3://$BUILD_ARTIFACTS_BUCKET/lambdas/"
-      - aws s3 cp lambda_build/data-tools.zip "s3://$BUILD_ARTIFACTS_BUCKET/lambdas/data-tools.zip"
-      - aws s3 cp lambda_build/memory-log.zip "s3://$BUILD_ARTIFACTS_BUCKET/lambdas/memory-log.zip"
-
-      - echo "Pointing Lambdas at the new code (best-effort; skipped if the functions do not exist yet)"
-      - if aws lambda get-function --function-name "$DATA_TOOLS_FN_NAME" >/dev/null 2>&1; then
-          aws lambda update-function-code --function-name "$DATA_TOOLS_FN_NAME" --s3-bucket "$BUILD_ARTIFACTS_BUCKET" --s3-key lambdas/data-tools.zip --publish > /dev/null;
-          echo "Updated $DATA_TOOLS_FN_NAME";
-        else
-          echo "Skipping $DATA_TOOLS_FN_NAME (does not exist yet — deploy CDK stack first)";
-        fi
-      - if aws lambda get-function --function-name "$MEMORY_LOG_FN_NAME" >/dev/null 2>&1; then
-          aws lambda update-function-code --function-name "$MEMORY_LOG_FN_NAME" --s3-bucket "$BUILD_ARTIFACTS_BUCKET" --s3-key lambdas/memory-log.zip --publish > /dev/null;
-          echo "Updated $MEMORY_LOG_FN_NAME";
-        else
-          echo "Skipping $MEMORY_LOG_FN_NAME (does not exist yet — deploy CDK stack first)";
-        fi
-
       - echo "Pushed $IMAGE_URI:latest and $IMAGE_URI:$SHORT_SHA"
-      - printf '{"imageUri":"%s","imageTag":"%s","dataToolsZip":"s3://%s/lambdas/data-tools.zip","memoryLogZip":"s3://%s/lambdas/memory-log.zip"}\n' "$IMAGE_URI" "$SHORT_SHA" "$BUILD_ARTIFACTS_BUCKET" "$BUILD_ARTIFACTS_BUCKET" > imageDetail.json
+      - printf '{"imageUri":"%s","imageTag":"%s"}\n' "$IMAGE_URI" "$SHORT_SHA" > imageDetail.json
 
 artifacts:
   files:
