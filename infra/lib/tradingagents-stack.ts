@@ -286,9 +286,14 @@ export class TradingAgentsStack extends cdk.Stack {
           "bedrock:InvokeModel",
           "bedrock:InvokeModelWithResponseStream",
         ],
+        // Cross-region inference profiles fan out to multiple regions (e.g.
+        // us. prefix routes to us-east-1/us-east-2/us-west-2) so the
+        // foundation-model ARN needs a region wildcard; the profile ARN
+        // itself is account-scoped to this region.
         resources: [
-          `arn:aws:bedrock:${this.region}::foundation-model/anthropic.claude-*`,
+          `arn:aws:bedrock:*::foundation-model/anthropic.claude-*`,
           `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.anthropic.*`,
+          `arn:aws:bedrock:*:${this.account}:inference-profile/us.anthropic.*`,
         ],
       }),
     );
@@ -358,10 +363,16 @@ export class TradingAgentsStack extends cdk.Stack {
       });
 
       // Feed the runtime ARN into the invoker Lambda env.
-      // Per CFN docs, Ref on AWS::BedrockAgentCore::Runtime returns the ARN.
+      // The CFN docs say Ref returns the ARN, but in practice Ref returns the
+      // shorter "<name>-<hash>" identifier. Fn::GetAtt on AgentRuntimeArn
+      // produces the full ARN that bedrock-agentcore:InvokeAgentRuntime needs.
+      const runtimeArn = cdk.Fn.getAtt(
+        agentRuntime.logicalId,
+        "AgentRuntimeArn",
+      ).toString();
       (invokeAgentFn.node.defaultChild as lambda.CfnFunction).addPropertyOverride(
         "Environment.Variables.AGENTCORE_RUNTIME_ARN",
-        agentRuntime.ref,
+        runtimeArn,
       );
     }
 
@@ -389,6 +400,22 @@ export class TradingAgentsStack extends cdk.Stack {
         },
       });
 
+      // Tool schemas — declared inline because Gateway requires them for
+      // every MCP Lambda target. Kept intentionally minimal: ticker + date
+      // where applicable. The Lambdas accept additional fields but Gateway
+      // only advertises these to agent clients.
+      const dateInput = {
+        Type: "object",
+        Properties: {
+          ticker: { Type: "string", Description: "Stock ticker symbol" },
+          trade_date: {
+            Type: "string",
+            Description: "ISO trade date, YYYY-MM-DD",
+          },
+        },
+        Required: ["ticker", "trade_date"],
+      };
+
       const dataToolsTarget = new cdk.CfnResource(
         this,
         "GatewayTargetDataTools",
@@ -398,10 +425,71 @@ export class TradingAgentsStack extends cdk.Stack {
             GatewayIdentifier: gateway.ref,
             Name: "data-tools",
             Description: "Market-data tools: yfinance / alpha_vantage",
+            CredentialProviderConfigurations: [
+              { CredentialProviderType: "GATEWAY_IAM_ROLE" },
+            ],
             TargetConfiguration: {
-              McpTargetConfiguration: {
-                LambdaTargetConfiguration: {
+              Mcp: {
+                Lambda: {
                   LambdaArn: dataToolsFn.functionArn,
+                  ToolSchema: {
+                    InlinePayload: [
+                      {
+                        Name: "get_stock_data",
+                        Description: "OHLCV price history for a ticker",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_indicators",
+                        Description: "Technical indicators (MACD, RSI, etc.)",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_fundamentals",
+                        Description: "Company fundamentals summary",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_balance_sheet",
+                        Description: "Latest balance-sheet items",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_cashflow",
+                        Description: "Cash-flow statement summary",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_income_statement",
+                        Description: "Income statement summary",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_news",
+                        Description: "Ticker-specific news headlines",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_insider_transactions",
+                        Description: "Recent insider trades",
+                        InputSchema: dateInput,
+                      },
+                      {
+                        Name: "get_global_news",
+                        Description: "Top macro / global news",
+                        InputSchema: {
+                          Type: "object",
+                          Properties: {
+                            trade_date: {
+                              Type: "string",
+                              Description: "ISO trade date",
+                            },
+                          },
+                          Required: ["trade_date"],
+                        },
+                      },
+                    ],
+                  },
                 },
               },
             },
@@ -419,10 +507,57 @@ export class TradingAgentsStack extends cdk.Stack {
             GatewayIdentifier: gateway.ref,
             Name: "memory-log",
             Description: "Persistent decision log backed by DynamoDB",
+            CredentialProviderConfigurations: [
+              { CredentialProviderType: "GATEWAY_IAM_ROLE" },
+            ],
             TargetConfiguration: {
-              McpTargetConfiguration: {
-                LambdaTargetConfiguration: {
+              Mcp: {
+                Lambda: {
                   LambdaArn: memoryLogFn.functionArn,
+                  ToolSchema: {
+                    InlinePayload: [
+                      {
+                        Name: "get_past_context",
+                        Description:
+                          "Recent same-ticker decisions plus cross-ticker lessons",
+                        InputSchema: {
+                          Type: "object",
+                          Properties: {
+                            ticker: { Type: "string" },
+                            n_same: { Type: "integer" },
+                            n_cross: { Type: "integer" },
+                          },
+                          Required: ["ticker"],
+                        },
+                      },
+                      {
+                        Name: "store_decision",
+                        Description: "Append a pending decision to the log",
+                        InputSchema: {
+                          Type: "object",
+                          Properties: {
+                            ticker: { Type: "string" },
+                            trade_date: { Type: "string" },
+                            final_trade_decision: { Type: "string" },
+                          },
+                          Required: [
+                            "ticker",
+                            "trade_date",
+                            "final_trade_decision",
+                          ],
+                        },
+                      },
+                      {
+                        Name: "get_pending_entries",
+                        Description:
+                          "List pending decisions awaiting outcome resolution",
+                        InputSchema: {
+                          Type: "object",
+                          Properties: {},
+                        },
+                      },
+                    ],
+                  },
                 },
               },
             },
@@ -593,7 +728,10 @@ export class TradingAgentsStack extends cdk.Stack {
     });
     if (agentRuntime) {
       new cdk.CfnOutput(this, "AgentCoreRuntimeArnOut", {
-        value: agentRuntime.ref,
+        value: cdk.Fn.getAtt(
+          agentRuntime.logicalId,
+          "AgentRuntimeArn",
+        ).toString(),
       });
     }
     if (gateway) {
