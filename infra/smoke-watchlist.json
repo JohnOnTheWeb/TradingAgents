@@ -1,0 +1,8 @@
+{
+  "date": "today",
+  "deep_model": "us.anthropic.claude-opus-4-7",
+  "quick_model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+  "tickers": [
+    { "symbol": "NVDA", "analysts": ["market"], "debate_rounds": 0 }
+  ]
+}

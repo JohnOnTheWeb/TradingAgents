@@ -1,20 +1,48 @@
-"""Append-only markdown decision log for TradingAgents."""
+"""Append-only markdown decision log for TradingAgents.
 
-from typing import List, Optional
+Set ``TRADINGAGENTS_MEMORY_BACKEND=dynamodb`` to swap the file-backed log
+for the DynamoDB implementation used in AWS (see ``memory_dynamodb.py``).
+Both backends expose the same public methods that the rest of the pipeline
+calls (``store_decision``, ``get_past_context``, ``get_pending_entries``,
+``batch_update_with_outcomes``), so callers don't care which one they get.
+"""
+
+import os
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 import re
 
 from tradingagents.agents.utils.rating import parse_rating
 
 
+def _pick_backend(config: Optional[Dict[str, Any]]) -> str:
+    return (
+        (config or {}).get("memory_backend")
+        or os.environ.get("TRADINGAGENTS_MEMORY_BACKEND", "file")
+    ).lower()
+
+
 class TradingMemoryLog:
-    """Append-only markdown log of trading decisions and reflections."""
+    """Append-only markdown log of trading decisions and reflections.
+
+    When ``TRADINGAGENTS_MEMORY_BACKEND=dynamodb`` (or ``memory_backend``
+    is set to the same in ``config``), ``__new__`` swaps this out for
+    :class:`~tradingagents.agents.utils.memory_dynamodb.DynamoDBMemoryLog`
+    while preserving the existing ``TradingMemoryLog(config)`` call site.
+    """
 
     # HTML comment: cannot appear in LLM prose output, safe as a hard delimiter
     _SEPARATOR = "\n\n<!-- ENTRY_END -->\n\n"
     # Precompiled patterns — avoids re-compilation on every load_entries() call
     _DECISION_RE = re.compile(r"DECISION:\n(.*?)(?=\nREFLECTION:|\Z)", re.DOTALL)
     _REFLECTION_RE = re.compile(r"REFLECTION:\n(.*?)$", re.DOTALL)
+
+    def __new__(cls, config: dict = None):
+        if cls is TradingMemoryLog and _pick_backend(config) == "dynamodb":
+            from tradingagents.agents.utils.memory_dynamodb import DynamoDBMemoryLog
+
+            return DynamoDBMemoryLog(config)
+        return super().__new__(cls)
 
     def __init__(self, config: dict = None):
         cfg = config or {}
