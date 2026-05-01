@@ -237,14 +237,15 @@ def run() -> Dict[str, Any]:
 
 def main() -> int:
     try:
-        result = run()
+        run()
     except Exception as err:  # noqa: BLE001
         logger.exception("task_runner fatal: %s", err)
+        # Only truly fatal paths (couldn't even write a result JSON) get a
+        # non-zero exit. Graceful failures (AgentCore error, md-store write
+        # fail, etc.) are already persisted to s3 so the aggregator can
+        # render them — exiting zero keeps Step Functions' Map state happy.
         return 2
-    # Exit non-zero on known failure statuses so Step Functions' EcsRunTask.sync
-    # catch branch fires and routes to the error notifier.
-    status = str(result.get("status", "")).lower()
-    return 0 if status == "success" else 1
+    return 0
 
 
 if __name__ == "__main__":

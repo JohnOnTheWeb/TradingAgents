@@ -638,18 +638,16 @@ export class TradingAgentsStack extends cdk.Stack {
     // Step Functions state machine
     // ------------------------------------------------------------------
 
-    const buildErrorBranch = (
-      stage: string,
-    ): sfn.IChainable => {
+    const buildErrorBranch = (stage: string): sfn.IChainable => {
       const notify = new tasks.LambdaInvoke(this, `NotifyError_${stage}`, {
         lambdaFunction: errorHandlerFn,
         payload: sfn.TaskInput.fromObject({
           stage,
-          // The schedule input is {config_key}, not {run_id}/{trade_date},
-          // so don't try to read those fields from $$.Execution.Input —
-          // the values live on the current state's input after GetConfig.
-          "run_id.$": "States.JsonToString($)",
-          "ticker.$": "$.ticker",
+          // Keep the payload shape forgiving — different catch sites have
+          // different input shapes (GetConfig has no $.config yet; Map
+          // catches see the parent state's input, not a per-iteration one).
+          // Pass the whole current input as "context" plus the error dict.
+          "context.$": "States.JsonToString($)",
           "error.$": "$.error",
         }),
       });
