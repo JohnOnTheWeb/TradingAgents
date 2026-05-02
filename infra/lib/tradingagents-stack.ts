@@ -1373,8 +1373,16 @@ export class TradingAgentsStack extends cdk.Stack {
           })
         : null;
 
+    // Max concurrent Fargate tasks in the per-ticker Map. Default 3.
+    // Override with `-c mapConcurrency=N` at deploy time.
+    const mapConcurrencyRaw = this.node.tryGetContext("mapConcurrency");
+    const mapConcurrency =
+      typeof mapConcurrencyRaw === "number"
+        ? mapConcurrencyRaw
+        : parseInt(String(mapConcurrencyRaw ?? "3"), 10) || 3;
+
     const tickerMap = new sfn.Map(this, "PerTickerMap", {
-      maxConcurrency: 3,
+      maxConcurrency: mapConcurrency,
       itemsPath: "$.config.tickers",
       itemSelector: {
         "run_id.$": "$.config.run_id",

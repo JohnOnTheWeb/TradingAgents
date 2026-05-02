@@ -42,17 +42,29 @@ class TastytradeClient:
         self._expires_at: float = 0.0
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(timeout=20.0)
+        # Short-circuit auth after a failure so concurrent callers don't all
+        # re-refresh with the same bad token.
+        self._auth_fail_until: float = 0.0
+        self._auth_fail_reason: str = ""
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
     async def _ensure_access_token(self) -> str:
         now = time.monotonic()
+        if now < self._auth_fail_until:
+            raise TastytradeError(
+                f"Tastytrade auth circuit open (last error: {self._auth_fail_reason})"
+            )
         if self._access_token and now < self._expires_at - _REFRESH_BUFFER_SEC:
             return self._access_token
         async with self._lock:
             # Re-check inside the lock — another coroutine may have refreshed.
             now = time.monotonic()
+            if now < self._auth_fail_until:
+                raise TastytradeError(
+                    f"Tastytrade auth circuit open (last error: {self._auth_fail_reason})"
+                )
             if self._access_token and now < self._expires_at - _REFRESH_BUFFER_SEC:
                 return self._access_token
             resp = await self._http.post(
@@ -66,9 +78,10 @@ class TastytradeClient:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             if resp.status_code >= 400:
-                raise TastytradeError(
-                    f"Tastytrade OAuth refresh failed ({resp.status_code}): {resp.text[:200]}"
-                )
+                reason = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                self._auth_fail_reason = reason
+                self._auth_fail_until = time.monotonic() + 300.0
+                raise TastytradeError(f"Tastytrade OAuth refresh failed ({reason})")
             payload = resp.json()
             self._access_token = payload["access_token"]
             expires_in = float(payload.get("expires_in", 900))

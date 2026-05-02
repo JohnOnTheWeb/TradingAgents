@@ -42,6 +42,11 @@ class SchwabClient:
         self._expires_at: float = 0.0
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(timeout=20.0)
+        # Once OAuth refresh fails, short-circuit subsequent calls for 5 min
+        # so 15 concurrent analyst ToolNodes don't each hammer Schwab's auth
+        # endpoint with the same bad creds.
+        self._auth_fail_until: float = 0.0
+        self._auth_fail_reason: str = ""
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -52,10 +57,18 @@ class SchwabClient:
 
     async def _ensure_access_token(self) -> str:
         now = time.monotonic()
+        if now < self._auth_fail_until:
+            raise SchwabError(
+                f"Schwab auth circuit open (last error: {self._auth_fail_reason})"
+            )
         if self._access_token and now < self._expires_at - _REFRESH_BUFFER_SEC:
             return self._access_token
         async with self._lock:
             now = time.monotonic()
+            if now < self._auth_fail_until:
+                raise SchwabError(
+                    f"Schwab auth circuit open (last error: {self._auth_fail_reason})"
+                )
             if self._access_token and now < self._expires_at - _REFRESH_BUFFER_SEC:
                 return self._access_token
             resp = await self._http.post(
@@ -70,9 +83,10 @@ class SchwabClient:
                 },
             )
             if resp.status_code >= 400:
-                raise SchwabError(
-                    f"Schwab OAuth refresh failed ({resp.status_code}): {resp.text[:200]}"
-                )
+                reason = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                self._auth_fail_reason = reason
+                self._auth_fail_until = time.monotonic() + 300.0
+                raise SchwabError(f"Schwab OAuth refresh failed ({reason})")
             payload = resp.json()
             self._access_token = payload["access_token"]
             expires_in = float(payload.get("expires_in", 1800))

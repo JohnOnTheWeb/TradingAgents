@@ -1,31 +1,42 @@
-import time
 import logging
+import os
+import random
+import time
+from typing import Annotated
 
 import pandas as pd
 import yfinance as yf
-from yfinance.exceptions import YFRateLimitError
 from stockstats import wrap
-from typing import Annotated
-import os
+from yfinance.exceptions import YFRateLimitError
+
 from .config import get_config
 
 logger = logging.getLogger(__name__)
 
+# Jitter window (seconds) applied before every yfinance call. At high ticker
+# concurrency (Step Functions Map >3) multiple analyst branches fire yfinance
+# calls in lockstep; a random pre-call sleep breaks the stampede and smooths
+# the request burst across yfinance's per-IP rate limit window.
+_YF_JITTER_MAX_SEC = float(os.environ.get("YF_JITTER_MAX_SEC", "0.5"))
+
 
 def yf_retry(func, max_retries=3, base_delay=2.0):
-    """Execute a yfinance call with exponential backoff on rate limits.
+    """Execute a yfinance call with pre-call jitter + exponential backoff on 429.
 
-    yfinance raises YFRateLimitError on HTTP 429 responses but does not
-    retry them internally. This wrapper adds retry logic specifically
-    for rate limits. Other exceptions propagate immediately.
+    yfinance raises YFRateLimitError on HTTP 429 but does not retry internally.
+    This wrapper (a) adds 0-500ms random jitter before the first attempt to
+    de-sync concurrent callers, and (b) retries 429s with exponential backoff.
+    Other exceptions propagate immediately.
     """
+    if _YF_JITTER_MAX_SEC > 0:
+        time.sleep(random.uniform(0, _YF_JITTER_MAX_SEC))
     for attempt in range(max_retries + 1):
         try:
             return func()
         except YFRateLimitError:
             if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"Yahoo Finance rate limited, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})")
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1.0)
+                logger.warning(f"Yahoo Finance rate limited, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
             else:
                 raise
