@@ -65,7 +65,16 @@ export class TradingAgentsStack extends cdk.Stack {
     // Hoist the brokerage-mcp references so they're in scope for the
     // AgentCore Runtime env-var injection earlier in the stack. Actual
     // resources are created in the brokerage-mcp block below.
+    //
+    // brokerageMcpUrl is consumed by AgentCore Runtime and the Fargate
+    // task-def which are constructed BEFORE the brokerage block. We
+    // capture the value into a plain variable at brokerage-block time
+    // and use cdk.Lazy.string to defer the env-var read until synth,
+    // by which time the mutation has happened.
     let brokerageMcpUrl: string | undefined;
+    const brokerageMcpUrlToken = cdk.Lazy.string({
+      produce: () => brokerageMcpUrl ?? "",
+    });
     let brokerageMcpTarget: cdk.CfnResource | undefined;
     let brokerageProxyFn: lambda.Function | undefined;
     let brokerageSharedSecretRef: secretsmanager.Secret | undefined;
@@ -675,9 +684,9 @@ export class TradingAgentsStack extends cdk.Stack {
                   OTEL_SERVICE_NAME: "tradingagents-runtime",
                 }
               : {}),
-            ...(brokerageMcpUrl
+            ...(brokerageEnabled
               ? {
-                  BROKERAGE_MCP_URL: brokerageMcpUrl,
+                  BROKERAGE_MCP_URL: brokerageMcpUrlToken,
                   BROKERAGE_SHARED_SECRET_ID: "brokerage/shared-secret",
                 }
               : {}),
@@ -1062,9 +1071,9 @@ export class TradingAgentsStack extends cdk.Stack {
                 OTEL_SERVICE_NAME: "tradingagents-task-runner",
               }
             : {}),
-          ...(brokerageMcpUrl
+          ...(brokerageEnabled
             ? {
-                BROKERAGE_MCP_URL: brokerageMcpUrl,
+                BROKERAGE_MCP_URL: brokerageMcpUrlToken,
                 BROKERAGE_SHARED_SECRET_ID: "brokerage/shared-secret",
               }
             : {}),
@@ -1227,11 +1236,23 @@ export class TradingAgentsStack extends cdk.Stack {
         ecs.Secret.fromSecretsManager(brokerageSharedSecretRef, "secret"),
       );
 
+      // Breakable egg: first-time deploys can't pull :latest because the
+      // image doesn't exist yet. Use -c brokerageDesiredCount=0 on the
+      // initial deploy so the service is created but no tasks launch;
+      // after CodeBuild pushes the image, redeploy with default (=1).
+      const brokerageDesiredCountRaw = this.node.tryGetContext(
+        "brokerageDesiredCount",
+      );
+      const brokerageDesiredCount =
+        typeof brokerageDesiredCountRaw === "number"
+          ? brokerageDesiredCountRaw
+          : parseInt(String(brokerageDesiredCountRaw ?? "1"), 10);
+
       const brokerageService = new ecs.FargateService(this, "BrokerageService", {
         serviceName: "brokerage-mcp",
         cluster: brokerageCluster,
         taskDefinition: brokerageTaskDef,
-        desiredCount: 1,
+        desiredCount: Number.isFinite(brokerageDesiredCount) ? brokerageDesiredCount : 1,
         platformVersion: ecs.FargatePlatformVersion.LATEST,
         assignPublicIp: true,
         vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
