@@ -183,15 +183,18 @@ def _render_summary(
     )
     lines.append("")
 
-    # Full per-ticker conclusion blocks — the table only has the first line.
+    # Full per-ticker conclusion blocks. Prefer the Portfolio Manager's full
+    # final_trade_decision text (captured in the per-ticker S3 result); fall
+    # back to the short label that signal_processing parsed out.
     lines.append("## Conclusions")
     lines.append("")
     for r in items:
         ticker = str(r.get("ticker", "?")).upper()
-        decision = str(r.get("decision", "") or "").strip()
+        full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
+        short = str(r.get("decision", "") or "").strip()
         lines.append(f"### {ticker}")
         lines.append("")
-        lines.append(decision or "_no decision returned_")
+        lines.append(full or short or "_no decision returned_")
         lines.append("")
 
     if failures:
@@ -241,8 +244,10 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
         conclusion_blocks: List[str] = []
         for r in results:
             ticker = str(r.get("ticker", "?")).upper()
-            decision = str(r.get("decision", "") or "").strip() or "(no decision)"
-            conclusion_blocks.append(f"=== {ticker} ===\n{decision}")
+            full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
+            short = str(r.get("decision", "") or "").strip()
+            body_text = full or short or "(no decision)"
+            conclusion_blocks.append(f"=== {ticker} ===\n{body_text}")
         body = (
             f"TradingAgents run {run_id}\n"
             f"Date: {trade_date}\n"

@@ -74,12 +74,18 @@ def render_ticker_report(
     )
     lines.append("")
 
-    # Conclusion at the top.
+    # Conclusion at the top. Prefer the full Portfolio Manager text
+    # (final_state["final_trade_decision"]) and fall back to the short label
+    # that signal_processing parsed out.
+    full_decision = str(final_state.get("final_trade_decision") or "").strip()
+    conclusion = _demote_headings(full_decision or decision.strip())
     lines.append("## Decision")
     lines.append("")
-    lines.append(_demote_headings(decision.strip()) or "_no decision returned_")
+    lines.append(conclusion or "_no decision returned_")
     lines.append("")
 
+    # "final_trade_decision" is already rendered at the top as the Decision
+    # section — omit it here to avoid duplicating the full PM rationale.
     sections = [
         ("Market", "market_report"),
         ("Social / Sentiment", "sentiment_report"),
@@ -87,7 +93,6 @@ def render_ticker_report(
         ("Fundamentals", "fundamentals_report"),
         ("Investment plan (Research Manager)", "investment_plan"),
         ("Trader investment plan", "trader_investment_plan"),
-        ("Final trade decision (Portfolio Manager)", "final_trade_decision"),
     ]
     lines.append("## Analyst reports")
     lines.append("")
@@ -216,10 +221,11 @@ def render_summary(
     lines.append("")
     for r in items:
         ticker = str(r.get("ticker", "?")).upper()
-        decision = str(r.get("decision", "") or "").strip()
+        full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
+        short = str(r.get("decision", "") or "").strip()
         lines.append(f"### {ticker}")
         lines.append("")
-        lines.append(decision or "_no decision returned_")
+        lines.append(full or short or "_no decision returned_")
         lines.append("")
 
     if failures:
