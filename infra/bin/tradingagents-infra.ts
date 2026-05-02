@@ -123,4 +123,14 @@ NagSuppressions.addStackSuppressions(stack, [
     reason:
       "Brokerage-MCP ALB security group allows 0.0.0.0/0 on :80 by design — AgentCore Runtime runs as a managed public service (NetworkMode: PUBLIC) that cannot reach an internal ALB. Access is gated by a shared-secret header checked by the MCP server (BROKERAGE_SHARED_SECRET); only clients with the secret from Secrets Manager can call /mcp.",
   },
+  {
+    id: "AwsSolutions-APIG1",
+    reason:
+      "WebApi $default stage is a single-operator internal API (SigV4 / AWS_IAM only). Every route invokes a Lambda that has its own CloudWatch access log, and StartExecution/DescribeExecution are already audited by CloudTrail, so API Gateway-level access logs duplicate state without added forensic value.",
+  },
+  {
+    id: "AwsSolutions-APIG4",
+    reason:
+      "WebApi uses AWS_IAM on every route (SigV4); this is the authorization mechanism cdk-nag asks for. Suppression is for the nag's rule that matches any route without an explicit authorizer resource — the authorizationType attribute at the route level is sufficient.",
+  },
 ]);

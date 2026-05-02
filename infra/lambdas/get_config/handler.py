@@ -1,6 +1,15 @@
-"""Step 1 of the state machine: load the watchlist from S3.
+"""Step 1 of the state machine: resolve the run config.
 
-Input:  {"config_key": "watchlist.json"}      (from EventBridge Scheduler)
+Two accepted input shapes:
+
+* Inline (from the web API Lambda):
+    ``{"tickers": [{"symbol": "NVDA", ...}, ...],
+       "trade_date": "2026-05-02", "deep_model": "...", "quick_model": "...",
+       "run_id": "<uuid>"}``
+
+* S3-backed (from EventBridge Scheduler):
+    ``{"config_key": "watchlist.json"}``
+
 Output: {
     "run_id":     "<uuid>",
     "trade_date": "2026-04-30",
@@ -42,15 +51,22 @@ def _resolve_date(value: Any) -> str:
 
 
 def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
-    bucket = os.environ["TRADINGAGENTS_CONFIG_BUCKET"]
-    key = event.get("config_key") or "watchlist.json"
-
-    obj = _s3.get_object(Bucket=bucket, Key=key)
-    config = json.loads(obj["Body"].read().decode("utf-8"))
+    if event.get("tickers"):
+        config = {
+            "tickers": event["tickers"],
+            "date": event.get("trade_date"),
+            "deep_model": event.get("deep_model"),
+            "quick_model": event.get("quick_model"),
+        }
+    else:
+        bucket = os.environ["TRADINGAGENTS_CONFIG_BUCKET"]
+        key = event.get("config_key") or "watchlist.json"
+        obj = _s3.get_object(Bucket=bucket, Key=key)
+        config = json.loads(obj["Body"].read().decode("utf-8"))
 
     tickers_raw = config.get("tickers") or []
     if not tickers_raw:
-        raise ValueError(f"watchlist at s3://{bucket}/{key} has no tickers")
+        raise ValueError("no tickers provided (inline or in S3 watchlist)")
 
     deep = config.get("deep_model") or os.environ.get(
         "DEFAULT_DEEP_MODEL", "us.anthropic.claude-opus-4-7"

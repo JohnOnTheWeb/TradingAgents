@@ -77,7 +77,7 @@ def _write_local(broker: str, payload: Dict[str, str]) -> None:
             pass
     existing[broker] = payload
     LOCAL_FILE.write_text(json.dumps(existing, indent=2))
-    print(f"  → wrote {broker} creds to {LOCAL_FILE}")
+    print(f"  -> wrote {broker} creds to {LOCAL_FILE}")
 
 
 def refresh_schwab() -> None:

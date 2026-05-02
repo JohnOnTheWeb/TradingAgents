@@ -108,6 +108,10 @@ class InvocationResponse(BaseModel):
     token_usage: List[Dict[str, Any]] = Field(default_factory=list)
     cost_usd: float = 0.0
     error: Optional[str] = None
+    # Populated on success (and report_write_failed) so downstream replay
+    # can re-render the Markdown report without re-running the pipeline.
+    final_state: Optional[Dict[str, Any]] = None
+    token_buckets: Optional[List[Dict[str, Any]]] = None
 
 
 @app.get("/ping")
@@ -230,6 +234,8 @@ def invocations(payload: InvocationPayload) -> StreamingResponse:
                         token_usage=priced,
                         cost_usd=cost,
                         error=str(err),
+                        final_state=final_state,
+                        token_buckets=buckets,
                     ))
                     return
 
@@ -243,6 +249,8 @@ def invocations(payload: InvocationPayload) -> StreamingResponse:
                 report_key=report_key,
                 token_usage=priced,
                 cost_usd=cost,
+                final_state=final_state,
+                token_buckets=buckets,
             ))
         finally:
             span_cm.__exit__(None, None, None)

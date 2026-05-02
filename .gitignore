@@ -1,6 +1,9 @@
 # Local brokerage OAuth tokens — never commit
 .brokerage-tokens.json
 
+# Output of `python -m tradingagents.agentcore.replay_report`
+reports/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

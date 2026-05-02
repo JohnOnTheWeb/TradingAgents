@@ -130,6 +130,19 @@ def _load_ticker_result(
         }
 
 
+def _decision_oneline(decision: str, max_len: int = 140) -> str:
+    """First non-empty line of the decision, escaped for a table cell."""
+    text = (decision or "").strip()
+    if not text:
+        return "_no decision_"
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    # Escape pipe/newline chars that would break a Markdown table row.
+    first = first.replace("|", "\\|")
+    if len(first) > max_len:
+        first = first[: max_len - 3] + "..."
+    return first
+
+
 def _render_summary(
     trade_date: str, run_id: str, results: Iterable[Dict[str, Any]]
 ) -> str:
@@ -149,11 +162,12 @@ def _render_summary(
     lines.append("")
     lines.append("## Decisions at a glance")
     lines.append("")
-    lines.append("| Ticker | Status | Cost (USD) | Report |")
-    lines.append("|---|---|---:|---|")
+    lines.append("| Ticker | Status | Decision | Cost (USD) | Report |")
+    lines.append("|---|---|---|---:|---|")
     for r in items:
         ticker = str(r.get("ticker", "?")).upper()
         status = str(r.get("status", "?"))
+        decision_line = _decision_oneline(str(r.get("decision", "") or ""))
         cost = _fmt_usd(float(r.get("cost_usd", 0.0) or 0.0))
         key = r.get("report_key")
         if key:
@@ -161,9 +175,25 @@ def _render_summary(
             link = f"[{filename}]({filename})"
         else:
             link = "_no report_"
-        lines.append(f"| {ticker} | {status} | {cost} | {link} |")
-    lines.append(f"| **Total Bedrock cost** | | **{_fmt_usd(total)}** | |")
+        lines.append(
+            f"| {ticker} | {status} | {decision_line} | {cost} | {link} |"
+        )
+    lines.append(
+        f"| **Total Bedrock cost** | | | **{_fmt_usd(total)}** | |"
+    )
     lines.append("")
+
+    # Full per-ticker conclusion blocks — the table only has the first line.
+    lines.append("## Conclusions")
+    lines.append("")
+    for r in items:
+        ticker = str(r.get("ticker", "?")).upper()
+        decision = str(r.get("decision", "") or "").strip()
+        lines.append(f"### {ticker}")
+        lines.append("")
+        lines.append(decision or "_no decision returned_")
+        lines.append("")
+
     if failures:
         lines.append("## Failures")
         lines.append("")
@@ -198,7 +228,7 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
     successes = sum(1 for r in results if r.get("status") == "success")
     failures = len(results) - successes
 
-    summary_key = f"TauricTraders/_summary_{trade_date}.md"
+    summary_key = "TauricTraders/_summary.md"
     _write_md_store(summary_key, _render_summary(trade_date, run_id, results))
 
     topic = os.environ.get("SNS_NOTIFICATIONS_TOPIC")
@@ -208,6 +238,11 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
             f"[{r.get('status')}, {_fmt_usd(float(r.get('cost_usd') or 0.0))}]"
             for r in results
         ]
+        conclusion_blocks: List[str] = []
+        for r in results:
+            ticker = str(r.get("ticker", "?")).upper()
+            decision = str(r.get("decision", "") or "").strip() or "(no decision)"
+            conclusion_blocks.append(f"=== {ticker} ===\n{decision}")
         body = (
             f"TradingAgents run {run_id}\n"
             f"Date: {trade_date}\n"
@@ -215,7 +250,10 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
             f"Total Bedrock cost: {_fmt_usd(total_cost)}\n\n"
             f"Reports (md-store keys under TauricTraders/):\n"
             + "\n".join(report_lines)
-            + f"\n\nSummary: {summary_key}\n"
+            + f"\n\nSummary: {summary_key}\n\n"
+            "Conclusions:\n\n"
+            + "\n\n".join(conclusion_blocks)
+            + "\n"
         )
         subject = (
             f"TradingAgents run complete — {trade_date} — "

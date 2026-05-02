@@ -20,6 +20,7 @@ import * as snsSubs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
+import * as apigw from "aws-cdk-lib/aws-apigatewayv2";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const LAMBDA_DIR = path.join(REPO_ROOT, "infra", "lambdas");
@@ -54,6 +55,12 @@ export class TradingAgentsStack extends cdk.Stack {
     const brokerageEnabled =
       this.node.tryGetContext("brokerageEnabled") === "true" ||
       this.node.tryGetContext("brokerageEnabled") === true;
+
+    // Web API (API Gateway HTTP API → run_trigger/run_status Lambdas). Used
+    // by the local `ta-run` skill to kick off SFN executions over SigV4.
+    const apiEnabled =
+      this.node.tryGetContext("apiEnabled") === "true" ||
+      this.node.tryGetContext("apiEnabled") === true;
 
     // Hoist the brokerage-mcp references so they're in scope for the
     // AgentCore Runtime env-var injection earlier in the stack. Actual
@@ -1170,7 +1177,7 @@ export class TradingAgentsStack extends cdk.Stack {
       const brokerageTaskSg = new ec2.SecurityGroup(this, "BrokerageTaskSg", {
         vpc: brokerageVpc,
         securityGroupName: "brokerage-mcp-task-sg",
-        description: "Brokerage-MCP Fargate task — ALB-to-task on 8080",
+        description: "Brokerage-MCP Fargate task: ALB-to-task on 8080",
         allowAllOutbound: true,
       });
 
@@ -1182,7 +1189,7 @@ export class TradingAgentsStack extends cdk.Stack {
         vpc: brokerageVpc,
         securityGroupName: "brokerage-mcp-alb-sg",
         description:
-          "Public ALB for brokerage-mcp — open on :80, gated server-side by shared secret",
+          "Public ALB for brokerage-mcp: open on :80, gated server-side by shared secret",
         allowAllOutbound: true,
       });
       brokerageAlbSg.addIngressRule(
@@ -1193,7 +1200,7 @@ export class TradingAgentsStack extends cdk.Stack {
       brokerageTaskSg.addIngressRule(
         brokerageAlbSg,
         ec2.Port.tcp(8080),
-        "ALB → task on :8080",
+        "ALB to task on :8080",
       );
 
       brokerageSharedSecretRef = new secretsmanager.Secret(
@@ -1480,6 +1487,109 @@ export class TradingAgentsStack extends cdk.Stack {
     });
 
     // ------------------------------------------------------------------
+    // Web API (gated on apiEnabled) — HTTP API + run_trigger / run_status
+    // Lambdas, AWS_IAM authorizer (SigV4). Fronted by the local ta-run skill.
+    // ------------------------------------------------------------------
+
+    let httpApi: apigw.CfnApi | undefined;
+
+    if (apiEnabled) {
+      const runTriggerFn = new lambda.Function(this, "RunTriggerFn", {
+        functionName: "ta-run-trigger",
+        runtime: pythonRuntime,
+        handler: "handler.handler",
+        code: lambda.Code.fromAsset(path.join(LAMBDA_DIR, "run_trigger")),
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 256,
+        environment: {
+          STATE_MACHINE_ARN: stateMachine.stateMachineArn,
+        },
+        logRetention: logs.RetentionDays.ONE_MONTH,
+      });
+      stateMachine.grantStartExecution(runTriggerFn);
+
+      const runStatusFn = new lambda.Function(this, "RunStatusFn", {
+        functionName: "ta-run-status",
+        runtime: pythonRuntime,
+        handler: "handler.handler",
+        code: lambda.Code.fromAsset(path.join(LAMBDA_DIR, "run_status")),
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 256,
+        logRetention: logs.RetentionDays.ONE_MONTH,
+      });
+      runStatusFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["states:DescribeExecution"],
+          resources: [
+            `arn:aws:states:${this.region}:${this.account}:execution:${stateMachine.stateMachineName}:*`,
+          ],
+        }),
+      );
+
+      httpApi = new apigw.CfnApi(this, "WebApi", {
+        name: "tradingagents-api",
+        protocolType: "HTTP",
+        description: "TradingAgents run-trigger + run-status (AWS_IAM / SigV4)",
+      });
+
+      const triggerIntegration = new apigw.CfnIntegration(
+        this,
+        "RunTriggerIntegration",
+        {
+          apiId: httpApi.ref,
+          integrationType: "AWS_PROXY",
+          integrationUri: runTriggerFn.functionArn,
+          payloadFormatVersion: "2.0",
+          integrationMethod: "POST",
+        },
+      );
+      const statusIntegration = new apigw.CfnIntegration(
+        this,
+        "RunStatusIntegration",
+        {
+          apiId: httpApi.ref,
+          integrationType: "AWS_PROXY",
+          integrationUri: runStatusFn.functionArn,
+          payloadFormatVersion: "2.0",
+          integrationMethod: "POST",
+        },
+      );
+
+      new apigw.CfnRoute(this, "RunTriggerRoute", {
+        apiId: httpApi.ref,
+        routeKey: "POST /runs",
+        authorizationType: "AWS_IAM",
+        target: `integrations/${triggerIntegration.ref}`,
+      });
+      new apigw.CfnRoute(this, "RunStatusRoute", {
+        apiId: httpApi.ref,
+        routeKey: "GET /runs/{executionArn}",
+        authorizationType: "AWS_IAM",
+        target: `integrations/${statusIntegration.ref}`,
+      });
+
+      new apigw.CfnStage(this, "WebApiStage", {
+        apiId: httpApi.ref,
+        stageName: "$default",
+        autoDeploy: true,
+      });
+
+      // Lambda invoke permissions — API Gateway calls these Lambdas via
+      // lambda:InvokeFunction, restricted to this HTTP API's ARN.
+      const apiArnPrefix = `arn:aws:execute-api:${this.region}:${this.account}:${httpApi.ref}`;
+      runTriggerFn.addPermission("AllowApiGwInvokeTrigger", {
+        principal: new iam.ServicePrincipal("apigateway.amazonaws.com"),
+        action: "lambda:InvokeFunction",
+        sourceArn: `${apiArnPrefix}/*/*/runs`,
+      });
+      runStatusFn.addPermission("AllowApiGwInvokeStatus", {
+        principal: new iam.ServicePrincipal("apigateway.amazonaws.com"),
+        action: "lambda:InvokeFunction",
+        sourceArn: `${apiArnPrefix}/*/*/runs/*`,
+      });
+    }
+
+    // ------------------------------------------------------------------
     // Outputs
     // ------------------------------------------------------------------
 
@@ -1531,6 +1641,12 @@ export class TradingAgentsStack extends cdk.Stack {
     if (brokerageEcrRepo) {
       new cdk.CfnOutput(this, "BrokerageEcrRepoUri", {
         value: brokerageEcrRepo.repositoryUri,
+      });
+    }
+    if (httpApi) {
+      new cdk.CfnOutput(this, "WebApiUrl", {
+        value: `https://${httpApi.ref}.execute-api.${this.region}.amazonaws.com`,
+        description: "SigV4-signed HTTP API: POST /runs, GET /runs/{executionArn}",
       });
     }
   }

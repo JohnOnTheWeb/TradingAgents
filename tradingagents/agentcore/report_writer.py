@@ -164,11 +164,18 @@ def write_report(filename: str, content: str, *, overwrite: bool = True) -> str:
     return key
 
 
-def report_filename(ticker: str, trade_date: str) -> str:
-    """Convention: ``<TICKER>_<YYYY-MM-DD>.md``."""
-    return f"{ticker.upper()}_{trade_date}.md"
+def report_filename(ticker: str, trade_date: str = "") -> str:
+    """Convention: ``<TICKER>.md`` — one key per ticker, overwritten each run.
+
+    ``trade_date`` is accepted for backwards-compat with existing call sites
+    but is no longer part of the key; the run date lives inside the report.
+    """
+    return f"{ticker.upper()}.md"
 
 
-def summary_filename(trade_date: str) -> str:
-    """Convention: ``_summary_<YYYY-MM-DD>.md`` (leading underscore sorts it first)."""
-    return f"_summary_{trade_date}.md"
+def summary_filename(trade_date: str = "") -> str:
+    """Convention: ``_summary.md`` — one key, overwritten each run.
+
+    Leading underscore keeps it sorted first in an alphabetical listing.
+    """
+    return "_summary.md"
