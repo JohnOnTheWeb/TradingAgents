@@ -82,10 +82,15 @@ def _build_exporter(endpoint: str):
 
             return AWSSigV4OTLPExporter(endpoint=endpoint)
         except ImportError:
-            _logger.warning(
-                "TA_OTEL_SIGV4 is set but opensearch-genai-observability-sdk is not available; "
-                "falling back to unsigned OTLP HTTP exporter."
-            )
+            pass
+
+        sigv4_exporter = _build_sigv4_exporter(endpoint)
+        if sigv4_exporter is not None:
+            return sigv4_exporter
+        _logger.warning(
+            "TA_OTEL_SIGV4 is set but neither the blog SDK nor boto3 is available; "
+            "falling back to unsigned OTLP HTTP exporter — requests will be rejected by OSIS."
+        )
 
     try:
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -96,6 +101,58 @@ def _build_exporter(endpoint: str):
             "opentelemetry-exporter-otlp-proto-http is not installed; tracing disabled."
         )
         return None
+
+
+def _build_sigv4_exporter(endpoint: str):
+    """OTLPSpanExporter subclass that SigV4-signs POSTs to OSIS (osis service).
+
+    OSIS ingest endpoints require SigV4 against service ``osis``. The vendored
+    OTLP-HTTP exporter uses a ``requests.Session``; we post-process the
+    prepared request with ``botocore.auth.SigV4Auth`` before sending.
+    """
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    except ImportError:
+        return None
+
+    try:
+        import boto3
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+    except ImportError:
+        return None
+
+    region = (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
+    session = boto3.Session()
+    credentials = session.get_credentials()
+    if credentials is None:
+        _logger.warning("No AWS credentials available for SigV4 OTLP exporter.")
+        return None
+    signer = SigV4Auth(credentials, "osis", region)
+
+    traces_url = endpoint.rstrip("/") + "/v1/traces"
+
+    class _SigV4OTLPSpanExporter(OTLPSpanExporter):  # type: ignore[misc]
+        def _export(self, serialized_data):  # type: ignore[override]
+            aws_req = AWSRequest(
+                method="POST",
+                url=traces_url,
+                data=serialized_data,
+                headers={"Content-Type": "application/x-protobuf"},
+            )
+            signer.add_auth(aws_req)
+            return self._session.post(
+                url=traces_url,
+                data=serialized_data,
+                headers=dict(aws_req.headers),
+                timeout=self._timeout,
+            )
+
+    return _SigV4OTLPSpanExporter(endpoint=traces_url)
 
 
 def _shutdown() -> None:
