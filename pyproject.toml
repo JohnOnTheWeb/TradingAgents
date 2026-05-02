@@ -40,7 +40,10 @@ otel = [
     "opentelemetry-exporter-otlp-proto-http>=1.27.0",
     "opentelemetry-instrumentation-botocore>=0.48b0",
     "opentelemetry-instrumentation-requests>=0.48b0",
-    "opensearch-genai-observability-sdk @ git+https://github.com/aws-samples/opensearch-genai-observability-sdk-py.git",
+    # opensearch-genai-observability-sdk is not on PyPI and requires git in
+    # the build image to fetch from the AWS samples repo. The tracing layer
+    # falls back to vanilla OTel (above) when the SDK is unavailable, so
+    # skip the git-dep at install time.
 ]
 
 [project.scripts]
