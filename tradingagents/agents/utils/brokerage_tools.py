@@ -14,6 +14,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
+import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -23,8 +26,18 @@ from langchain_core.tools import tool
 
 _logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = float(os.environ.get("BROKERAGE_MCP_TIMEOUT", "20"))
+_DEFAULT_TIMEOUT = float(os.environ.get("BROKERAGE_MCP_TIMEOUT", "8"))
+_MAX_RETRIES = int(os.environ.get("BROKERAGE_MCP_MAX_RETRIES", "3"))
+# Process-wide circuit breaker: after repeated failures, short-circuit
+# subsequent calls for this many seconds so a dead sidecar doesn't block
+# every analyst ToolNode in a 15-way concurrent run.
+_CIRCUIT_COOLDOWN_SEC = float(os.environ.get("BROKERAGE_MCP_COOLDOWN", "120"))
+_CIRCUIT_FAIL_THRESHOLD = int(os.environ.get("BROKERAGE_MCP_FAIL_THRESHOLD", "3"))
+
 _cached_shared_secret: Optional[str] = None
+_circuit_lock = threading.Lock()
+_circuit_fails = 0
+_circuit_open_until = 0.0
 
 
 def _url() -> Optional[str]:
@@ -81,10 +94,48 @@ def _unavailable(reason: str) -> Dict[str, Any]:
     }
 
 
+def _circuit_check() -> Optional[str]:
+    """Return a short-circuit reason if the breaker is open, else None."""
+    now = time.monotonic()
+    with _circuit_lock:
+        if now < _circuit_open_until:
+            return f"brokerage circuit open (cooling down {_circuit_open_until - now:.0f}s)"
+    return None
+
+
+def _circuit_record_failure() -> None:
+    global _circuit_fails, _circuit_open_until
+    with _circuit_lock:
+        _circuit_fails += 1
+        if _circuit_fails >= _CIRCUIT_FAIL_THRESHOLD:
+            _circuit_open_until = time.monotonic() + _CIRCUIT_COOLDOWN_SEC
+            _circuit_fails = 0
+            _logger.warning(
+                "brokerage-mcp circuit breaker opened for %.0fs after repeated failures",
+                _CIRCUIT_COOLDOWN_SEC,
+            )
+
+
+def _circuit_record_success() -> None:
+    global _circuit_fails
+    with _circuit_lock:
+        _circuit_fails = 0
+
+
+def _do_request(req: urllib.request.Request) -> str:
+    with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as resp:
+        return resp.read().decode("utf-8")
+
+
 def _call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     url = _url()
     if not url:
         return _unavailable("BROKERAGE_MCP_URL not configured")
+
+    circuit_reason = _circuit_check()
+    if circuit_reason:
+        return _unavailable(circuit_reason)
+
     payload = {
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
@@ -96,29 +147,56 @@ def _call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     secret = _shared_secret()
     if secret:
         headers["X-Brokerage-Secret"] = secret
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace")[:200]
-        _logger.warning("brokerage-mcp HTTP %s for %s: %s", err.code, tool_name, detail)
-        return _unavailable(f"HTTP {err.code}")
-    except urllib.error.URLError as err:
-        _logger.warning("brokerage-mcp unreachable for %s: %s", tool_name, err.reason)
-        return _unavailable(f"unreachable: {err.reason}")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+    last_error = "unknown"
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            raw = _do_request(req)
+            break
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode("utf-8", errors="replace")[:200]
+            last_error = f"HTTP {err.code}"
+            # 4xx responses other than 429 won't improve by retrying — bail fast.
+            if err.code != 429 and 400 <= err.code < 500:
+                _logger.warning("brokerage-mcp %s for %s: %s", last_error, tool_name, detail)
+                _circuit_record_failure()
+                return _unavailable(last_error)
+            _logger.warning(
+                "brokerage-mcp %s for %s attempt %d/%d: %s",
+                last_error, tool_name, attempt, _MAX_RETRIES, detail,
+            )
+        except urllib.error.URLError as err:
+            last_error = f"unreachable: {err.reason}"
+            _logger.warning(
+                "brokerage-mcp %s for %s attempt %d/%d",
+                last_error, tool_name, attempt, _MAX_RETRIES,
+            )
+        except (TimeoutError, OSError) as err:
+            last_error = f"transport: {err}"
+            _logger.warning(
+                "brokerage-mcp %s for %s attempt %d/%d",
+                last_error, tool_name, attempt, _MAX_RETRIES,
+            )
+        if attempt < _MAX_RETRIES:
+            # Small jittered backoff: 0.3, 0.6, 1.2s +/- 25%.
+            delay = 0.3 * (2 ** (attempt - 1))
+            time.sleep(delay + random.uniform(0, delay * 0.25))
+    else:
+        _circuit_record_failure()
+        return _unavailable(last_error)
 
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
+        _circuit_record_failure()
         return _unavailable("non-JSON response")
     if "error" in parsed:
+        # RPC-level error (not a transport error) — record so repeated
+        # protocol-level problems still trip the breaker.
+        _circuit_record_failure()
         return _unavailable(f"rpc error: {parsed['error']}")
+    _circuit_record_success()
     result = parsed.get("result") or {}
     content = result.get("content") or []
     if content and content[0].get("type") == "json":
