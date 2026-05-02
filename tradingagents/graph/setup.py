@@ -6,6 +6,7 @@ from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.observability import wrap_node
 
 from .conditional_logic import ConditionalLogic
 
@@ -91,21 +92,24 @@ class GraphSetup:
 
         # Add analyst nodes to the graph
         for analyst_type, node in analyst_nodes.items():
-            workflow.add_node(f"{analyst_type.capitalize()} Analyst", node)
+            analyst_name = f"{analyst_type.capitalize()} Analyst"
+            clear_name = f"Msg Clear {analyst_type.capitalize()}"
+            tools_name = f"tools_{analyst_type}"
+            workflow.add_node(analyst_name, wrap_node(analyst_name, node))
             workflow.add_node(
-                f"Msg Clear {analyst_type.capitalize()}", delete_nodes[analyst_type]
+                clear_name, wrap_node(clear_name, delete_nodes[analyst_type])
             )
-            workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
+            workflow.add_node(tools_name, wrap_node(tools_name, tool_nodes[analyst_type]))
 
         # Add other nodes
-        workflow.add_node("Bull Researcher", bull_researcher_node)
-        workflow.add_node("Bear Researcher", bear_researcher_node)
-        workflow.add_node("Research Manager", research_manager_node)
-        workflow.add_node("Trader", trader_node)
-        workflow.add_node("Aggressive Analyst", aggressive_analyst)
-        workflow.add_node("Neutral Analyst", neutral_analyst)
-        workflow.add_node("Conservative Analyst", conservative_analyst)
-        workflow.add_node("Portfolio Manager", portfolio_manager_node)
+        workflow.add_node("Bull Researcher", wrap_node("Bull Researcher", bull_researcher_node))
+        workflow.add_node("Bear Researcher", wrap_node("Bear Researcher", bear_researcher_node))
+        workflow.add_node("Research Manager", wrap_node("Research Manager", research_manager_node))
+        workflow.add_node("Trader", wrap_node("Trader", trader_node))
+        workflow.add_node("Aggressive Analyst", wrap_node("Aggressive Analyst", aggressive_analyst))
+        workflow.add_node("Neutral Analyst", wrap_node("Neutral Analyst", neutral_analyst))
+        workflow.add_node("Conservative Analyst", wrap_node("Conservative Analyst", conservative_analyst))
+        workflow.add_node("Portfolio Manager", wrap_node("Portfolio Manager", portfolio_manager_node))
 
         # Define edges
         # Start with the first analyst

@@ -9,6 +9,7 @@ import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as opensearch from "aws-cdk-lib/aws-opensearchservice";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as scheduler from "aws-cdk-lib/aws-scheduler";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
@@ -39,6 +40,13 @@ export class TradingAgentsStack extends cdk.Stack {
     const agentCoreEnabled =
       this.node.tryGetContext("agentCoreEnabled") === "true" ||
       this.node.tryGetContext("agentCoreEnabled") === true;
+
+    // Unified observability via OpenSearch + AMP + OSIS. Gated on a context
+    // flag (default false) so `cdk synth` stays green until the operator
+    // explicitly opts in — mirrors the agentCoreEnabled two-phase rollout.
+    const observabilityEnabled =
+      this.node.tryGetContext("observabilityEnabled") === "true" ||
+      this.node.tryGetContext("observabilityEnabled") === true;
 
     // ------------------------------------------------------------------
     // Data stores
@@ -124,6 +132,226 @@ export class TradingAgentsStack extends cdk.Stack {
       },
     });
     ecrRepo.grantPullPush(codebuildProject);
+
+    // ------------------------------------------------------------------
+    // Observability — OpenSearch + AMP + OSIS (gated)
+    //
+    // Shape follows the AWS blog "Unified observability in Amazon
+    // OpenSearch Service": traces + logs land in OpenSearch via an OSIS
+    // pipeline (simple-schema-for-observability indices), metrics land in
+    // Amazon Managed Prometheus via remote_write. Exposed ingest endpoint
+    // is SigV4-authenticated; the Runtime + Fargate task roles get
+    // osis:Ingest below.
+    // ------------------------------------------------------------------
+
+    let observabilityDomain: opensearch.Domain | undefined;
+    let ampWorkspace: cdk.CfnResource | undefined;
+    let osisPipeline: cdk.CfnResource | undefined;
+    let osisPipelineArn: string | undefined;
+    let osisIngestEndpoint: string | undefined;
+
+    if (observabilityEnabled) {
+      const observabilityAdminRole = new iam.Role(
+        this,
+        "ObservabilityAdminRole",
+        {
+          roleName: "ta-observability-admin",
+          assumedBy: new iam.AccountPrincipal(this.account),
+          description:
+            "Admin role that can sign in to OpenSearch Dashboards for TradingAgents observability",
+        },
+      );
+
+      const osMasterSecret = new secretsmanager.Secret(
+        this,
+        "OpenSearchMasterSecret",
+        {
+          secretName: "tradingagents/opensearch-master",
+          description:
+            "Fine-grained access control master user for the TradingAgents OpenSearch domain",
+          generateSecretString: {
+            secretStringTemplate: JSON.stringify({ username: "tradingagents" }),
+            generateStringKey: "password",
+            // OpenSearch FGAC requires upper + lower + digit + special; keep the
+            // char set Secrets-Manager friendly by excluding quoting/escape chars.
+            excludeCharacters: "\"'\\/@ ",
+            includeSpace: false,
+            passwordLength: 24,
+            requireEachIncludedType: true,
+          },
+        },
+      );
+
+      // OSIS pipeline role — trusted by the Ingestion service. Created
+      // before the Domain so we can set the access policy inline on the
+      // domain (avoids a race against CDK's async addAccessPolicies custom
+      // resource — OSIS validates perms at create time).
+      const osisPipelineRole = new iam.Role(this, "OsisPipelineRole", {
+        roleName: "ta-osis-pipeline-role",
+        assumedBy: new iam.ServicePrincipal("osis-pipelines.amazonaws.com"),
+        description:
+          "Role OSIS assumes to write to OpenSearch + Amazon Managed Prometheus",
+      });
+
+      observabilityDomain = new opensearch.Domain(
+        this,
+        "ObservabilityDomain",
+        {
+          version: opensearch.EngineVersion.OPENSEARCH_2_17,
+          domainName: "ta-observability",
+          capacity: {
+            dataNodes: 1,
+            dataNodeInstanceType: "t3.small.search",
+            masterNodes: 0,
+          },
+          ebs: {
+            volumeSize: 20,
+            volumeType: ec2.EbsDeviceVolumeType.GP3,
+          },
+          zoneAwareness: { enabled: false },
+          enforceHttps: true,
+          nodeToNodeEncryption: true,
+          encryptionAtRest: { enabled: true },
+          fineGrainedAccessControl: {
+            masterUserName: "tradingagents",
+            masterUserPassword: osMasterSecret.secretValueFromJson("password"),
+          },
+          accessPolicies: [
+            new iam.PolicyStatement({
+              effect: iam.Effect.ALLOW,
+              principals: [
+                new iam.ArnPrincipal(osisPipelineRole.roleArn),
+                new iam.ArnPrincipal(observabilityAdminRole.roleArn),
+              ],
+              actions: ["es:ESHttp*"],
+              resources: [
+                `arn:aws:es:${this.region}:${this.account}:domain/ta-observability/*`,
+              ],
+            }),
+          ],
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
+        },
+      );
+      cdk.Tags.of(observabilityDomain).add("UsedBy", "TauricTrading");
+
+      // Attach the pipeline role's domain perms as a discrete Policy so we
+      // can make the OSIS pipeline explicitly depend on it (defeats the
+      // race where OSIS validates before the role's DefaultPolicy exists).
+      const osisPipelineRolePolicy = new iam.Policy(
+        this,
+        "OsisPipelineRolePolicy",
+        {
+          policyName: "ta-osis-pipeline-role-policy",
+          statements: [
+            new iam.PolicyStatement({
+              actions: ["es:DescribeDomain", "es:ESHttp*"],
+              resources: [
+                observabilityDomain.domainArn,
+                `${observabilityDomain.domainArn}/*`,
+              ],
+            }),
+          ],
+        },
+      );
+      osisPipelineRolePolicy.attachToRole(osisPipelineRole);
+
+      // Amazon Managed Prometheus workspace (L1 — no L2 construct yet).
+      ampWorkspace = new cdk.CfnResource(this, "AmpWorkspace", {
+        type: "AWS::APS::Workspace",
+        properties: {
+          Alias: "tradingagents-metrics",
+          Tags: [{ Key: "UsedBy", Value: "TauricTrading" }],
+        },
+      });
+      const ampWorkspaceArn = cdk.Fn.getAtt(
+        ampWorkspace.logicalId,
+        "Arn",
+      ).toString();
+      const ampRemoteWriteUrl = cdk.Fn.join("", [
+        "https://aps-workspaces.",
+        this.region,
+        ".amazonaws.com/workspaces/",
+        cdk.Fn.getAtt(ampWorkspace.logicalId, "WorkspaceId").toString(),
+        "/api/v1/remote_write",
+      ]);
+      osisPipelineRole.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["aps:RemoteWrite"],
+          resources: [ampWorkspaceArn],
+        }),
+      );
+
+      // OSIS CloudWatch log group.
+      const osisLogGroup = new logs.LogGroup(this, "OsisPipelineLogs", {
+        logGroupName: "/aws/vendedlogs/OpenSearchService/pipelines/ta-otel",
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+
+      const pipelineName = "ta-otel";
+      const osHost = cdk.Fn.join("", [
+        "https://",
+        observabilityDomain.domainEndpoint,
+      ]);
+
+      // Pipeline configuration YAML — single OTLP traces sub-pipeline.
+      // Traces use index_type: trace-analytics-raw (index name managed by
+      // the plugin). OTel logs (otel_logs_source) and metrics (prometheus
+      // sink) are deferred — the app doesn't emit structured OTel logs
+      // yet, and the prometheus sink has non-trivial auth semantics that
+      // need a separate pass. All three dashboards (Fleet/Run/Ticker)
+      // read from traces only, so this is sufficient for Phase-A.
+      const pipelineConfig = cdk.Fn.join("", [
+        "version: '2'\n",
+        "otlp-traces:\n",
+        "  source:\n",
+        "    otel_trace_source:\n",
+        "      path: /v1/traces\n",
+        "  sink:\n",
+        "    - opensearch:\n",
+        `        hosts: [ "${osHost}" ]\n`,
+        "        aws:\n",
+        `          sts_role_arn: "${osisPipelineRole.roleArn}"\n`,
+        `          region: "${this.region}"\n`,
+        "        index_type: trace-analytics-raw\n",
+      ]);
+
+      osisPipeline = new cdk.CfnResource(this, "OsisPipeline", {
+        type: "AWS::OSIS::Pipeline",
+        properties: {
+          PipelineName: pipelineName,
+          MinUnits: 1,
+          MaxUnits: 2,
+          PipelineConfigurationBody: pipelineConfig,
+          LogPublishingOptions: {
+            IsLoggingEnabled: true,
+            CloudWatchLogDestination: {
+              LogGroup: osisLogGroup.logGroupName,
+            },
+          },
+          Tags: [{ Key: "UsedBy", Value: "TauricTrading" }],
+        },
+      });
+      osisPipeline.addDependency(
+        observabilityDomain.node.defaultChild as cdk.CfnResource,
+      );
+      osisPipeline.addDependency(ampWorkspace);
+      // OSIS validates the role's access to the domain at CreatePipeline
+      // time; the role's inline policy must exist first.
+      osisPipeline.node.addDependency(osisPipelineRolePolicy);
+
+      osisPipelineArn = cdk.Fn.getAtt(
+        osisPipeline.logicalId,
+        "PipelineArn",
+      ).toString();
+      const ingestEndpoints = cdk.Token.asList(
+        cdk.Fn.getAtt(osisPipeline.logicalId, "IngestEndpointUrls"),
+      );
+      osisIngestEndpoint = cdk.Fn.join("", [
+        "https://",
+        cdk.Fn.select(0, ingestEndpoints),
+      ]);
+    }
 
     // ------------------------------------------------------------------
     // Notification plumbing
@@ -322,6 +550,31 @@ export class TradingAgentsStack extends cdk.Stack {
         resources: [ecrRepo.repositoryArn],
       }),
     );
+    if (observabilityEnabled && osisPipelineArn) {
+      runtimeRole.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["osis:Ingest"],
+          resources: [osisPipelineArn],
+        }),
+      );
+    }
+
+    // Shared env vars injected when observability is on. AgentCore Runtime
+    // and Fargate both need the same OTLP config so spans from both sides
+    // reach the OSIS endpoint. Gated additionally on agentCoreEnabled so the
+    // observability flag can be flipped on during a phase-1 deploy without
+    // the app image failing (spans just land locally until the rebuilt
+    // image ships).
+    const observabilityEnvVars =
+      observabilityEnabled && agentCoreEnabled && osisIngestEndpoint
+        ? {
+            OTEL_EXPORTER_OTLP_ENDPOINT: osisIngestEndpoint,
+            OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
+            OTEL_RESOURCE_ATTRIBUTES:
+              "deployment.environment=prod,service.namespace=tradingagents",
+            TA_OTEL_SIGV4: "1",
+          }
+        : undefined;
 
     let agentRuntime: cdk.CfnResource | undefined;
     let gateway: cdk.CfnResource | undefined;
@@ -344,6 +597,12 @@ export class TradingAgentsStack extends cdk.Stack {
             MD_STORE_SECRET_ID: mdStoreSecret.secretName,
             MD_STORE_AGENT_ID: "tauric-traders",
             AWS_DEFAULT_REGION: this.region,
+            ...(observabilityEnvVars
+              ? {
+                  ...observabilityEnvVars,
+                  OTEL_SERVICE_NAME: "tradingagents-runtime",
+                }
+              : {}),
           },
           ProtocolConfiguration: "HTTP",
           NetworkConfiguration: { NetworkMode: "PUBLIC" },
@@ -607,6 +866,12 @@ export class TradingAgentsStack extends cdk.Stack {
           AGENTCORE_TIMEOUT: "3600",
           TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
           TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
+          ...(observabilityEnvVars
+            ? {
+                ...observabilityEnvVars,
+                OTEL_SERVICE_NAME: "tradingagents-task-runner",
+              }
+            : {}),
         },
       });
 
@@ -618,6 +883,14 @@ export class TradingAgentsStack extends cdk.Stack {
         }),
       );
       configBucket.grantReadWrite(taskDef.taskRole);
+      if (observabilityEnabled && osisPipelineArn) {
+        taskDef.taskRole.addToPrincipalPolicy(
+          new iam.PolicyStatement({
+            actions: ["osis:Ingest"],
+            resources: [osisPipelineArn],
+          }),
+        );
+      }
 
       // Security group — egress-only, no inbound.
       taskSecurityGroup = new ec2.SecurityGroup(this, "TaskSg", {
@@ -848,6 +1121,24 @@ export class TradingAgentsStack extends cdk.Stack {
     if (gateway) {
       new cdk.CfnOutput(this, "GatewayUrlOut", {
         value: cdk.Fn.getAtt(gateway.logicalId, "GatewayUrl").toString(),
+      });
+    }
+    if (observabilityDomain) {
+      new cdk.CfnOutput(this, "OpenSearchDomainEndpoint", {
+        value: observabilityDomain.domainEndpoint,
+      });
+      new cdk.CfnOutput(this, "OpenSearchDashboardsUrl", {
+        value: `https://${observabilityDomain.domainEndpoint}/_dashboards/`,
+      });
+    }
+    if (ampWorkspace) {
+      new cdk.CfnOutput(this, "AmpWorkspaceId", {
+        value: cdk.Fn.getAtt(ampWorkspace.logicalId, "WorkspaceId").toString(),
+      });
+    }
+    if (osisIngestEndpoint) {
+      new cdk.CfnOutput(this, "OsisPipelineIngestUrl", {
+        value: osisIngestEndpoint,
       });
     }
   }

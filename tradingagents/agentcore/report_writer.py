@@ -15,6 +15,9 @@ from typing import Optional
 import urllib.error
 import urllib.request
 
+from tradingagents.observability import get_tracer
+from tradingagents.observability.attributes import TA_BYTES_WRITTEN
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ENDPOINT = "https://jjjtiltcja.execute-api.us-east-1.amazonaws.com/prod/mcp/v2"
@@ -132,16 +135,22 @@ def write_report(filename: str, content: str, *, overwrite: bool = True) -> str:
         headers=headers,
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace")
-        raise ReportWriteError(
-            f"md-store write_file failed: HTTP {err.code} {detail}"
-        ) from err
-    except urllib.error.URLError as err:
-        raise ReportWriteError(f"md-store unreachable: {err.reason}") from err
+    tracer = get_tracer("tradingagents.md_store")
+    with tracer.start_as_current_span("ta.md_store_write") as span:
+        span.set_attribute("ta.md_store.key", key)
+        span.set_attribute(TA_BYTES_WRITTEN, len(content))
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                span.set_attribute("http.status_code", resp.status)
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as err:
+            span.set_attribute("http.status_code", err.code)
+            detail = err.read().decode("utf-8", errors="replace")
+            raise ReportWriteError(
+                f"md-store write_file failed: HTTP {err.code} {detail}"
+            ) from err
+        except urllib.error.URLError as err:
+            raise ReportWriteError(f"md-store unreachable: {err.reason}") from err
 
     try:
         parsed = json.loads(body)

@@ -34,6 +34,14 @@ dependencies = [
 
 [project.optional-dependencies]
 bedrock = ["langchain-aws>=0.2.0", "boto3>=1.35.0"]
+otel = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+    "opentelemetry-instrumentation-botocore>=0.48b0",
+    "opentelemetry-instrumentation-requests>=0.48b0",
+    "opensearch-genai-observability-sdk @ git+https://github.com/aws-samples/opensearch-genai-observability-sdk-py.git",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"

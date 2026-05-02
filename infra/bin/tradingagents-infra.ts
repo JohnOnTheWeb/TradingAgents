@@ -88,4 +88,29 @@ NagSuppressions.addStackSuppressions(stack, [
     reason:
       "Task env vars hold only non-sensitive resource names (S3 bucket, DynamoDB table, ECR tag). Per-run secrets (AgentCore runtime ARN, ticker, date) arrive via Step Functions containerOverrides, not hardcoded in the task definition.",
   },
+  {
+    id: "AwsSolutions-OS1",
+    reason:
+      "Observability domain is deliberately public-access so the OSIS pipeline (AWS-managed service) can write to it without VPC peering. Access is restricted via fine-grained access control + IAM.",
+  },
+  {
+    id: "AwsSolutions-OS3",
+    reason:
+      "OSIS pipeline endpoint is public; IP allowlisting isn't compatible with OSIS (its source IPs aren't stable). Authentication relies on FGAC + SigV4.",
+  },
+  {
+    id: "AwsSolutions-OS4",
+    reason:
+      "Dedicated master nodes are unnecessary for a single-node observability domain (D1 in the observability plan). This is a low-traffic internal tool; data-node-only shape is the documented decision.",
+  },
+  {
+    id: "AwsSolutions-OS7",
+    reason:
+      "Zone awareness requires an even number of data nodes across multiple AZs. The plan (D1) specifies a single node to keep costs at ~$25/mo; HA is explicitly out of scope for this observability tool.",
+  },
+  {
+    id: "AwsSolutions-OS9",
+    reason:
+      "Slow-log publishing doubles CloudWatch Logs cost for a single-node observability tool where operators can query the domain directly. OSIS pipeline already publishes its own logs for the ingest path.",
+  },
 ]);

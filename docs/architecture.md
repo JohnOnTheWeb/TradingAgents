@@ -302,3 +302,55 @@ Runtime handles every scheduled ticker.
 - Fargate entrypoint: [`tradingagents/agentcore/task_runner.py`](../tradingagents/agentcore/task_runner.py).
 - CDK stack: [`infra/lib/tradingagents-stack.ts`](../infra/lib/tradingagents-stack.ts).
 - Lambda handlers (get-config / aggregate / error / MCP-target data-tools / MCP-target memory-log): [`infra/lambdas/`](../infra/lambdas/).
+
+## 6. Step Functions ↔ Fargate ↔ AgentCore Runtime interaction
+
+Zoomed-in view of the three orchestration layers that drive a single
+scheduled run. Step Functions owns fan-out and aggregation, Fargate owns
+the long-running per-ticker invocation, and AgentCore Runtime owns the
+agent execution + streaming protocol.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SFN as Step Functions<br/>(tradingagents-run)
+    participant Map as Map State<br/>(MaxConcurrency=3)
+    participant ECS as Fargate Task<br/>(task_runner.py)
+    participant ACR as AgentCore Runtime<br/>(FastAPI /invocations)
+    participant S3 as S3 ta-config
+
+    SFN->>SFN: GetConfig Lambda<br/>loads watchlist.json
+    SFN->>Map: fan out tickers
+
+    loop per ticker (up to 3 concurrent)
+        Map->>ECS: RunTask.sync<br/>env: TICKER, TRADE_DATE, RUN_ID
+        activate ECS
+        ECS->>ACR: invoke_agent_runtime<br/>accept=application/x-ndjson<br/>payload={ticker, trade_date, …}
+        activate ACR
+
+        ACR->>ACR: spawn worker thread<br/>LangGraph pipeline starts
+
+        loop every 10s until pipeline done
+            ACR-->>ECS: NDJSON: {"type":"heartbeat"}<br/>(resets 15-min idle timer)
+        end
+
+        ACR-->>ECS: NDJSON: {"type":"result",<br/>decision, tokens, cost,<br/>report_key}
+        deactivate ACR
+
+        ECS->>S3: put runs/<run_id>/<ticker>.json
+        ECS-->>Map: task exit 0
+        deactivate ECS
+    end
+
+    Map->>SFN: all iterations complete
+    SFN->>SFN: Aggregate Lambda<br/>(collect results, email, md-store)
+```
+
+### Key interaction points
+
+| Step | Why it matters |
+|---|---|
+| `RunTask.sync` | Step Functions blocks the Map iteration until the Fargate task exits — no polling, no callback token needed. |
+| NDJSON stream + heartbeats | The Fargate task holds a single HTTP connection open; heartbeats every 10s keep AgentCore's 15-min idle killer from terminating long deep-research runs. |
+| Per-ticker S3 write | Fargate writes one result file per ticker so Aggregate Lambda can collect them without reading stdout from Map iterations. |
+| Shared ECR image | AgentCore Runtime container and the Fargate task_runner are the same image; CMD override picks the entry point. |

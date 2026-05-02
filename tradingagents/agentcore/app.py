@@ -60,6 +60,17 @@ from tradingagents.agentcore.report_writer import (
 from tradingagents.agentcore.token_tracker import PerModelTokenTracker
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.observability import (
+    TA_COST_USD,
+    TA_DECISION,
+    TA_RUN_ID,
+    TA_TICKER,
+    TA_TRADE_DATE,
+    get_tracer,
+    init_tracing,
+)
+
+init_tracing("tradingagents-runtime")
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -83,6 +94,7 @@ class InvocationPayload(BaseModel):
     quick_model: Optional[str] = None
     run_id: Optional[str] = None
     write_report: bool = True
+    traceparent: Optional[str] = None
 
 
 class InvocationResponse(BaseModel):
@@ -113,10 +125,23 @@ def invocations(payload: InvocationPayload) -> StreamingResponse:
         started = time.monotonic()
         tracker = PerModelTokenTracker()
 
+        parent_ctx = _extract_traceparent(payload.traceparent)
+        tracer = get_tracer("tradingagents.runtime")
+        span_cm = tracer.start_as_current_span("ta.invocation", context=parent_ctx)
+        span = span_cm.__enter__()
+        span.set_attribute(TA_RUN_ID, run_id)
+        span.set_attribute(TA_TICKER, payload.ticker)
+        span.set_attribute(TA_TRADE_DATE, trade_date)
+
+        from opentelemetry import context as otel_context
+
+        worker_ctx = otel_context.get_current()
+
         # Container for the worker thread's return value.
         result_holder: Dict[str, Any] = {}
 
         def worker() -> None:
+            token = otel_context.attach(worker_ctx)
             try:
                 final_state, decision = _run_pipeline(payload, trade_date, tracker)
                 result_holder["final_state"] = final_state
@@ -124,6 +149,8 @@ def invocations(payload: InvocationPayload) -> StreamingResponse:
             except BaseException as err:  # noqa: BLE001
                 result_holder["error"] = err
                 result_holder["traceback"] = traceback.format_exc()
+            finally:
+                otel_context.detach(token)
 
         t = threading.Thread(target=worker, daemon=True, name=f"ta-run-{run_id}")
         t.start()
@@ -146,73 +173,102 @@ def invocations(payload: InvocationPayload) -> StreamingResponse:
         buckets = tracker.as_list()
         priced = summarize(buckets)
         cost = total_cost(buckets)
+        span.set_attribute(TA_COST_USD, cost)
 
-        if "error" in result_holder:
-            err = result_holder["error"]
-            logger.error(
-                "invocation failed for ticker=%s run_id=%s:\n%s",
-                payload.ticker, run_id, result_holder.get("traceback", ""),
-            )
-            final = InvocationResponse(
-                ticker=payload.ticker,
-                trade_date=trade_date,
-                run_id=run_id,
-                status="failed",
-                duration_seconds=duration,
-                decision="",
-                token_usage=priced,
-                cost_usd=cost,
-                error=f"{type(err).__name__}: {err}",
-            )
-            yield _result_event(final)
-            return
+        try:
+            if "error" in result_holder:
+                err = result_holder["error"]
+                logger.error(
+                    "invocation failed for ticker=%s run_id=%s:\n%s",
+                    payload.ticker, run_id, result_holder.get("traceback", ""),
+                )
+                _mark_span_error(span, err)
+                final = InvocationResponse(
+                    ticker=payload.ticker,
+                    trade_date=trade_date,
+                    run_id=run_id,
+                    status="failed",
+                    duration_seconds=duration,
+                    decision="",
+                    token_usage=priced,
+                    cost_usd=cost,
+                    error=f"{type(err).__name__}: {err}",
+                )
+                yield _result_event(final)
+                return
 
-        final_state = result_holder.get("final_state") or {}
-        decision = result_holder.get("decision", "") or ""
-        report_key: Optional[str] = None
-        if payload.write_report:
-            markdown = render_ticker_report(
+            final_state = result_holder.get("final_state") or {}
+            decision = result_holder.get("decision", "") or ""
+            if decision:
+                span.set_attribute(TA_DECISION, decision)
+            report_key: Optional[str] = None
+            if payload.write_report:
+                markdown = render_ticker_report(
+                    ticker=payload.ticker,
+                    trade_date=trade_date,
+                    run_id=run_id,
+                    status="success",
+                    duration_seconds=duration,
+                    final_state=final_state,
+                    decision=decision,
+                    token_buckets=buckets,
+                )
+                try:
+                    report_key = write_report(
+                        report_filename(payload.ticker, trade_date), markdown
+                    )
+                except ReportWriteError as err:
+                    logger.error("md-store write failed for %s: %s", payload.ticker, err)
+                    _mark_span_error(span, err)
+                    yield _result_event(InvocationResponse(
+                        ticker=payload.ticker,
+                        trade_date=trade_date,
+                        run_id=run_id,
+                        status="report_write_failed",
+                        duration_seconds=duration,
+                        decision=decision,
+                        token_usage=priced,
+                        cost_usd=cost,
+                        error=str(err),
+                    ))
+                    return
+
+            yield _result_event(InvocationResponse(
                 ticker=payload.ticker,
                 trade_date=trade_date,
                 run_id=run_id,
                 status="success",
                 duration_seconds=duration,
-                final_state=final_state,
                 decision=decision,
-                token_buckets=buckets,
-            )
-            try:
-                report_key = write_report(
-                    report_filename(payload.ticker, trade_date), markdown
-                )
-            except ReportWriteError as err:
-                logger.error("md-store write failed for %s: %s", payload.ticker, err)
-                yield _result_event(InvocationResponse(
-                    ticker=payload.ticker,
-                    trade_date=trade_date,
-                    run_id=run_id,
-                    status="report_write_failed",
-                    duration_seconds=duration,
-                    decision=decision,
-                    token_usage=priced,
-                    cost_usd=cost,
-                    error=str(err),
-                ))
-                return
-
-        yield _result_event(InvocationResponse(
-            ticker=payload.ticker,
-            trade_date=trade_date,
-            run_id=run_id,
-            status="success",
-            duration_seconds=duration,
-            decision=decision,
-            report_key=report_key,
-            token_usage=priced,
-            cost_usd=cost,
-        ))
+                report_key=report_key,
+                token_usage=priced,
+                cost_usd=cost,
+            ))
+        finally:
+            span_cm.__exit__(None, None, None)
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+def _extract_traceparent(traceparent: Optional[str]):
+    if not traceparent:
+        return None
+    try:
+        from opentelemetry.propagate import extract
+
+        return extract({"traceparent": traceparent})
+    except Exception:
+        return None
+
+
+def _mark_span_error(span, err: BaseException) -> None:
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_status(Status(StatusCode.ERROR, f"{type(err).__name__}: {err}"))
+        span.record_exception(err)
+    except Exception:
+        pass
 
 
 def _result_event(resp: InvocationResponse) -> bytes:

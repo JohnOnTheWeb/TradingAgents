@@ -44,6 +44,16 @@ from typing import Any, Dict, Iterable, List, Optional
 import boto3
 from botocore.config import Config
 
+from tradingagents.observability import (
+    TA_RUN_ID,
+    TA_TICKER,
+    TA_TRADE_DATE,
+    get_tracer,
+    init_tracing,
+)
+
+init_tracing("tradingagents-task-runner")
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -120,6 +130,23 @@ def run() -> Dict[str, Any]:
     prefix = _env("TA_RESULT_KEY_PREFIX", "runs/") or "runs/"
     result_key = f"{prefix}{run_id}/{ticker}.json"
 
+    tracer = get_tracer("tradingagents.task_runner")
+    with tracer.start_as_current_span("ta.fargate_invoke") as span:
+        span.set_attribute(TA_RUN_ID, run_id)
+        span.set_attribute(TA_TICKER, ticker)
+        span.set_attribute(TA_TRADE_DATE, trade_date)
+        return _run_invocation(run_id, ticker, trade_date, runtime_arn, config_bucket, result_key, span)
+
+
+def _run_invocation(
+    run_id: str,
+    ticker: str,
+    trade_date: str,
+    runtime_arn: str,
+    config_bucket: str,
+    result_key: str,
+    span,
+) -> Dict[str, Any]:
     invoke_payload: Dict[str, Any] = {
         "ticker": ticker,
         "trade_date": trade_date,
@@ -135,6 +162,10 @@ def run() -> Dict[str, Any]:
     analysts = _parse_analysts()
     if analysts:
         invoke_payload["analysts"] = analysts
+
+    traceparent = _current_traceparent()
+    if traceparent:
+        invoke_payload["traceparent"] = traceparent
 
     client = boto3.client(
         "bedrock-agentcore",
@@ -233,6 +264,17 @@ def run() -> Dict[str, Any]:
     result_event.setdefault("token_usage", [])
     _write_result(config_bucket, result_key, result_event)
     return result_event
+
+
+def _current_traceparent() -> Optional[str]:
+    try:
+        from opentelemetry.propagate import inject
+
+        carrier: Dict[str, str] = {}
+        inject(carrier)
+        return carrier.get("traceparent")
+    except Exception:
+        return None
 
 
 def main() -> int:
