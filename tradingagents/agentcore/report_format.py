@@ -168,6 +168,27 @@ def _decision_oneline(decision: str, max_len: int = 140) -> str:
     return first
 
 
+def _strip_investment_thesis(text: str) -> str:
+    """Drop the '**Investment Thesis**: ...' paragraph from a PM decision.
+
+    The thesis is a multi-paragraph justification that's valuable in the
+    per-ticker report but too verbose for the cross-ticker summary. It
+    runs from the ``**Investment Thesis**:`` marker until the next
+    ``**Field**:`` marker (Price Target, Time Horizon, etc.) or end of text.
+    """
+    if not text:
+        return text
+    import re
+    pattern = re.compile(
+        r"\*\*Investment Thesis\*\*:.*?(?=\n\s*\*\*[A-Z][^*]*\*\*:|\Z)",
+        re.DOTALL,
+    )
+    stripped = pattern.sub("", text)
+    # Collapse resulting triple-blank-lines back to double.
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    return stripped
+
+
 def render_summary(
     *,
     trade_date: str,
@@ -223,9 +244,10 @@ def render_summary(
         ticker = str(r.get("ticker", "?")).upper()
         full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
         short = str(r.get("decision", "") or "").strip()
+        body = _strip_investment_thesis(full) if full else short
         lines.append(f"### {ticker}")
         lines.append("")
-        lines.append(full or short or "_no decision returned_")
+        lines.append(body or "_no decision returned_")
         lines.append("")
 
     if failures:

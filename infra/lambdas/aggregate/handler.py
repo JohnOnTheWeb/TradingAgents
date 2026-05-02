@@ -143,6 +143,22 @@ def _decision_oneline(decision: str, max_len: int = 140) -> str:
     return first
 
 
+def _strip_investment_thesis(text: str) -> str:
+    """Drop the verbose '**Investment Thesis**: ...' paragraph from a PM
+    decision so the cross-ticker summary stays readable. Keeps Rating,
+    Executive Summary, Price Target, Time Horizon."""
+    if not text:
+        return text
+    import re
+    pattern = re.compile(
+        r"\*\*Investment Thesis\*\*:.*?(?=\n\s*\*\*[A-Z][^*]*\*\*:|\Z)",
+        re.DOTALL,
+    )
+    stripped = pattern.sub("", text)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    return stripped
+
+
 def _render_summary(
     trade_date: str, run_id: str, results: Iterable[Dict[str, Any]]
 ) -> str:
@@ -185,16 +201,19 @@ def _render_summary(
 
     # Full per-ticker conclusion blocks. Prefer the Portfolio Manager's full
     # final_trade_decision text (captured in the per-ticker S3 result); fall
-    # back to the short label that signal_processing parsed out.
+    # back to the short label that signal_processing parsed out. The
+    # Investment Thesis section is stripped here — it's too verbose for the
+    # cross-ticker summary; readers can click through to the ticker report.
     lines.append("## Conclusions")
     lines.append("")
     for r in items:
         ticker = str(r.get("ticker", "?")).upper()
         full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
         short = str(r.get("decision", "") or "").strip()
+        body = _strip_investment_thesis(full) if full else short
         lines.append(f"### {ticker}")
         lines.append("")
-        lines.append(full or short or "_no decision returned_")
+        lines.append(body or "_no decision returned_")
         lines.append("")
 
     if failures:
@@ -246,7 +265,7 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
             ticker = str(r.get("ticker", "?")).upper()
             full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
             short = str(r.get("decision", "") or "").strip()
-            body_text = full or short or "(no decision)"
+            body_text = (_strip_investment_thesis(full) if full else short) or "(no decision)"
             conclusion_blocks.append(f"=== {ticker} ===\n{body_text}")
         body = (
             f"TradingAgents run {run_id}\n"
