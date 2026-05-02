@@ -137,7 +137,9 @@ def _build_sigv4_exporter(endpoint: str):
     traces_url = endpoint.rstrip("/") + "/v1/traces"
 
     class _SigV4OTLPSpanExporter(OTLPSpanExporter):  # type: ignore[misc]
-        def _export(self, serialized_data):  # type: ignore[override]
+        def _export(self, serialized_data, *args, **kwargs):  # type: ignore[override]
+            # OTel SDK >=1.27 passes (serialized_data, deadline_sec); earlier
+            # versions passed just serialized_data. Accept both.
             aws_req = AWSRequest(
                 method="POST",
                 url=traces_url,
@@ -145,11 +147,18 @@ def _build_sigv4_exporter(endpoint: str):
                 headers={"Content-Type": "application/x-protobuf"},
             )
             signer.add_auth(aws_req)
+            timeout = self._timeout
+            if args:
+                # deadline_sec (seconds remaining); treat as per-request timeout.
+                try:
+                    timeout = float(args[0])
+                except (TypeError, ValueError):
+                    pass
             return self._session.post(
                 url=traces_url,
                 data=serialized_data,
                 headers=dict(aws_req.headers),
-                timeout=self._timeout,
+                timeout=timeout,
             )
 
     return _SigV4OTLPSpanExporter(endpoint=traces_url)
