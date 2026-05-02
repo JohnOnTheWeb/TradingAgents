@@ -99,7 +99,11 @@ class GraphSetup:
             workflow.add_node(
                 clear_name, wrap_node(clear_name, delete_nodes[analyst_type])
             )
-            workflow.add_node(tools_name, wrap_node(tools_name, tool_nodes[analyst_type]))
+            # ToolNode is a callable class instance with LangGraph-specific
+            # dispatch semantics — wrapping it breaks the call protocol.
+            # The botocore auto-instrumentation still captures tool/Bedrock
+            # calls that originate inside the node.
+            workflow.add_node(tools_name, tool_nodes[analyst_type])
 
         # Add other nodes
         workflow.add_node("Bull Researcher", wrap_node("Bull Researcher", bull_researcher_node))
