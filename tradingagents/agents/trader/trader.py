@@ -28,7 +28,10 @@ def create_trader(llm):
                 "content": (
                     "You are a trading agent analyzing market data to make investment decisions. "
                     "Based on your analysis, provide a specific recommendation to buy, sell, or hold. "
-                    "Anchor your reasoning in the analysts' reports and the research plan."
+                    "Anchor your reasoning in the analysts' reports and the research plan. "
+                    "When the reports cite brokerage-feed signals (IV rank, IV-HV spread, liquidity rank, "
+                    "spread_bps), use them to temper conviction: thin liquidity or wide spreads mean the "
+                    "full thesis may not be executable at the expected price and conviction should be down-weighted."
                 ),
             },
             {

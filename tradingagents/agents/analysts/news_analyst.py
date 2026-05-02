@@ -1,6 +1,8 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
+    get_corporate_events,
+    get_earnings_context,
     get_global_news,
     get_language_instruction,
     get_news,
@@ -16,10 +18,13 @@ def create_news_analyst(llm):
         tools = [
             get_news,
             get_global_news,
+            get_earnings_context,
+            get_corporate_events,
         ]
 
         system_message = (
             "You are a news researcher tasked with analyzing recent news and trends over the past week. Please write a comprehensive report of the current state of the world that is relevant for trading and macroeconomics. Use the available tools: get_news(query, start_date, end_date) for company-specific or targeted news searches, and get_global_news(curr_date, look_back_days, limit) for broader macroeconomic news. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
+            + " Brokerage-feed tools (optional): `get_earnings_context` gives the next earnings date, time-of-day (BMO/AMC), confirmation status, and recent EPS surprise history — use it to frame the news window ('beat 4 of 4 prints, stock rallied; this quarter's print is BMO tomorrow'). `get_corporate_events` provides recent dividend + earnings history for secular context. If `sources` shows both providers failed/skipped, proceed without them."
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )

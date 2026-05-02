@@ -8,6 +8,7 @@ import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as opensearch from "aws-cdk-lib/aws-opensearchservice";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -47,6 +48,20 @@ export class TradingAgentsStack extends cdk.Stack {
     const observabilityEnabled =
       this.node.tryGetContext("observabilityEnabled") === "true" ||
       this.node.tryGetContext("observabilityEnabled") === true;
+
+    // Read-only brokerage MCP sidecar (Schwab + Tastytrade via brokerage_mcp).
+    // Gated independently so the existing stack can deploy without it.
+    const brokerageEnabled =
+      this.node.tryGetContext("brokerageEnabled") === "true" ||
+      this.node.tryGetContext("brokerageEnabled") === true;
+
+    // Hoist the brokerage-mcp references so they're in scope for the
+    // AgentCore Runtime env-var injection earlier in the stack. Actual
+    // resources are created in the brokerage-mcp block below.
+    let brokerageMcpUrl: string | undefined;
+    let brokerageMcpTarget: cdk.CfnResource | undefined;
+    let brokerageProxyFn: lambda.Function | undefined;
+    let brokerageSharedSecretRef: secretsmanager.Secret | undefined;
 
     // ------------------------------------------------------------------
     // Data stores
@@ -132,6 +147,56 @@ export class TradingAgentsStack extends cdk.Stack {
       },
     });
     ecrRepo.grantPullPush(codebuildProject);
+
+    // ------------------------------------------------------------------
+    // Brokerage-MCP — ECR + CodeBuild (gated on brokerageEnabled)
+    // Dedicated ECR repo + CodeBuild project so brokerage image builds
+    // independently from the main tradingagents image.
+    // ------------------------------------------------------------------
+
+    let brokerageEcrRepo: ecr.Repository | undefined;
+
+    if (brokerageEnabled) {
+      brokerageEcrRepo = new ecr.Repository(this, "BrokerageMcpImage", {
+        repositoryName: "brokerage-mcp",
+        imageScanOnPush: true,
+        imageTagMutability: ecr.TagMutability.MUTABLE,
+        lifecycleRules: [
+          { maxImageCount: 10, description: "Retain last 10 images" },
+        ],
+      });
+
+      const brokerageBuild = new codebuild.Project(this, "BrokerageBuildProject", {
+        projectName: "brokerage-mcp-build",
+        source: codebuild.Source.gitHub({
+          owner: "JohnOnTheWeb",
+          repo: "TradingAgents",
+          branchOrRef: "main",
+          webhook: false,
+          cloneDepth: 1,
+        }),
+        environment: {
+          buildImage: codebuild.LinuxArmBuildImage.AMAZON_LINUX_2_STANDARD_3_0,
+          computeType: codebuild.ComputeType.SMALL,
+          privileged: true,
+        },
+        buildSpec: codebuild.BuildSpec.fromSourceFilename("buildspec.brokerage.yml"),
+        environmentVariables: {
+          AWS_ACCOUNT_ID: { value: this.account },
+          AWS_REGION: { value: this.region },
+          ECR_REPOSITORY: { value: brokerageEcrRepo.repositoryName },
+        },
+        logging: {
+          cloudWatch: {
+            logGroup: new logs.LogGroup(this, "BrokerageBuildLogs", {
+              retention: logs.RetentionDays.ONE_MONTH,
+              removalPolicy: cdk.RemovalPolicy.DESTROY,
+            }),
+          },
+        },
+      });
+      brokerageEcrRepo.grantPullPush(brokerageBuild);
+    }
 
     // ------------------------------------------------------------------
     // Observability — OpenSearch + AMP + OSIS (gated)
@@ -603,6 +668,12 @@ export class TradingAgentsStack extends cdk.Stack {
                   OTEL_SERVICE_NAME: "tradingagents-runtime",
                 }
               : {}),
+            ...(brokerageMcpUrl
+              ? {
+                  BROKERAGE_MCP_URL: brokerageMcpUrl,
+                  BROKERAGE_SHARED_SECRET_ID: "brokerage/shared-secret",
+                }
+              : {}),
           },
           ProtocolConfiguration: "HTTP",
           NetworkConfiguration: { NetworkMode: "PUBLIC" },
@@ -806,6 +877,118 @@ export class TradingAgentsStack extends cdk.Stack {
       memoryLogTarget.addDependency(gateway);
     }
 
+    // Brokerage-MCP Gateway target — read-only (no trading tools).
+    if (agentCoreEnabled && gateway && brokerageProxyFn) {
+      brokerageProxyFn.grantInvoke(gatewayRole);
+
+      const tickerInput = {
+        Type: "object",
+        Properties: {
+          ticker: { Type: "string", Description: "Stock ticker symbol" },
+        },
+        Required: ["ticker"],
+      };
+
+      brokerageMcpTarget = new cdk.CfnResource(this, "GatewayTargetBrokerage", {
+        type: "AWS::BedrockAgentCore::GatewayTarget",
+        properties: {
+          GatewayIdentifier: gateway.ref,
+          Name: "brokerage",
+          Description: "Read-only brokerage data (Schwab + Tastytrade) — vol regime, chains, earnings, liquidity",
+          CredentialProviderConfigurations: [
+            { CredentialProviderType: "GATEWAY_IAM_ROLE" },
+          ],
+          TargetConfiguration: {
+            Mcp: {
+              Lambda: {
+                LambdaArn: brokerageProxyFn.functionArn,
+                ToolSchema: {
+                  InlinePayload: [
+                    {
+                      Name: "get_vol_regime",
+                      Description: "IV rank/percentile, IV-HV spread, HV 30/60/90, beta, SPY corr, put/call ratio",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_term_structure",
+                      Description: "Implied volatility per option expiration (term structure)",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_options_chain",
+                      Description: "Options chain around ATM at expiration closest to dte_target with Greeks/OI",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: {
+                          ticker: { Type: "string" },
+                          dte_target: { Type: "integer", Description: "Target DTE" },
+                          strikes_width: { Type: "integer", Description: "Strikes on each side of ATM" },
+                        },
+                        Required: ["ticker"],
+                      },
+                    },
+                    {
+                      Name: "get_earnings_context",
+                      Description: "Next earnings date, time-of-day, recent EPS history",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_liquidity",
+                      Description: "Liquidity rating, rank, borrow rate, lendability",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_historical_vol",
+                      Description: "Realized volatility for given lookback windows",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: {
+                          ticker: { Type: "string" },
+                          windows: { Type: "array", Items: { Type: "integer" } },
+                        },
+                        Required: ["ticker"],
+                      },
+                    },
+                    {
+                      Name: "get_corporate_events",
+                      Description: "Recent dividend and earnings report history",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_quote",
+                      Description: "Level-1 quote: bid/ask/mid/last/spread_bps/day hi-lo",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_movers",
+                      Description: "Top movers for a market index; Schwab only, returns [] if unavailable",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: {
+                          index: { Type: "string", Description: "$SPX, $DJI, NASDAQ, etc." },
+                          sort: { Type: "string", Description: "VOLUME | TRADES | PERCENT_CHANGE_UP | PERCENT_CHANGE_DOWN" },
+                        },
+                      },
+                    },
+                    {
+                      Name: "search_instruments",
+                      Description: "Search instruments by ticker or description",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: { query: { Type: "string" } },
+                        Required: ["query"],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      });
+      brokerageMcpTarget.addDependency(gateway);
+    }
+
     // ------------------------------------------------------------------
     // ECS Fargate — per-ticker invoker replaces the old ta-invoke-agent
     // Lambda (which was boxed in by Lambda's 15-min hard cap).
@@ -872,6 +1055,12 @@ export class TradingAgentsStack extends cdk.Stack {
                 OTEL_SERVICE_NAME: "tradingagents-task-runner",
               }
             : {}),
+          ...(brokerageMcpUrl
+            ? {
+                BROKERAGE_MCP_URL: brokerageMcpUrl,
+                BROKERAGE_SHARED_SECRET_ID: "brokerage/shared-secret",
+              }
+            : {}),
         },
       });
 
@@ -883,6 +1072,9 @@ export class TradingAgentsStack extends cdk.Stack {
         }),
       );
       configBucket.grantReadWrite(taskDef.taskRole);
+      if (brokerageSharedSecretRef) {
+        brokerageSharedSecretRef.grantRead(taskDef.taskRole);
+      }
       if (observabilityEnabled && osisPipelineArn) {
         taskDef.taskRole.addToPrincipalPolicy(
           new iam.PolicyStatement({
@@ -905,6 +1097,190 @@ export class TradingAgentsStack extends cdk.Stack {
         agentRuntime.logicalId,
         "AgentRuntimeArn",
       ).toString();
+    }
+
+    // ------------------------------------------------------------------
+    // Brokerage-MCP sidecar — Fargate service + internal ALB (gated)
+    //
+    // Read-only MCP server that unifies Schwab + Tastytrade data. Runs as a
+    // single long-lived Fargate task behind an internal ALB so the AgentCore
+    // Runtime and the task-runner Fargate can reach it over the VPC. Tokens
+    // come from two Secrets Manager secrets (populated via the local
+    // /brokerage-refresh skill).
+    // ------------------------------------------------------------------
+
+    if (brokerageEnabled && brokerageEcrRepo) {
+      // Shared VPC with the task runner. Use the same default VPC lookup.
+      const brokerageVpc =
+        taskVpc ?? ec2.Vpc.fromLookup(this, "BrokerageDefaultVpc", { isDefault: true });
+
+      const schwabSecret = new secretsmanager.Secret(this, "BrokerageSchwabSecret", {
+        secretName: "brokerage/schwab-oauth",
+        description:
+          "Schwab Individual Trader OAuth: {refresh_token, client_id, client_secret}. Rotated via the /brokerage-refresh skill.",
+      });
+      const tastytradeSecret = new secretsmanager.Secret(this, "BrokerageTastytradeSecret", {
+        secretName: "brokerage/tastytrade-oauth",
+        description:
+          "Tastytrade Open API OAuth: {refresh_token, client_id, client_secret}. Rotated via the /brokerage-refresh skill.",
+      });
+
+      const brokerageCluster = new ecs.Cluster(this, "BrokerageCluster", {
+        clusterName: "brokerage-mcp",
+        vpc: brokerageVpc,
+        containerInsightsV2: ecs.ContainerInsights.DISABLED,
+      });
+
+      const brokerageLogGroup = new logs.LogGroup(this, "BrokerageMcpLogs", {
+        logGroupName: "/aws/ecs/brokerage-mcp",
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+
+      const brokerageTaskDef = new ecs.FargateTaskDefinition(this, "BrokerageTaskDef", {
+        family: "brokerage-mcp",
+        cpu: 512,
+        memoryLimitMiB: 1024,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.ARM64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
+      });
+
+      const brokerageServerContainer = brokerageTaskDef.addContainer("BrokerageMcp", {
+        containerName: "brokerage-mcp",
+        image: ecs.ContainerImage.fromEcrRepository(brokerageEcrRepo, "latest"),
+        logging: ecs.LogDrivers.awsLogs({
+          logGroup: brokerageLogGroup,
+          streamPrefix: "brokerage-mcp",
+        }),
+        environment: {
+          AWS_DEFAULT_REGION: this.region,
+          BROKERAGE_SCHWAB_SECRET: schwabSecret.secretName,
+          BROKERAGE_TASTYTRADE_SECRET: tastytradeSecret.secretName,
+          LOG_LEVEL: "INFO",
+        },
+        portMappings: [{ containerPort: 8080, protocol: ecs.Protocol.TCP }],
+      });
+      schwabSecret.grantRead(brokerageTaskDef.taskRole);
+      tastytradeSecret.grantRead(brokerageTaskDef.taskRole);
+      // brokerageServerContainer will get BROKERAGE_SHARED_SECRET via ECS secrets
+      // block below, once the secret resource is defined.
+
+      const brokerageTaskSg = new ec2.SecurityGroup(this, "BrokerageTaskSg", {
+        vpc: brokerageVpc,
+        securityGroupName: "brokerage-mcp-task-sg",
+        description: "Brokerage-MCP Fargate task — ALB-to-task on 8080",
+        allowAllOutbound: true,
+      });
+
+      // ALB is internet-facing so AgentCore Runtime (a managed public service,
+      // NetworkMode: PUBLIC) can reach it. Access is gated by a shared-secret
+      // header checked in the MCP server — BROKERAGE_MCP_SHARED_SECRET — so
+      // the open :80 port only serves callers who know the secret.
+      const brokerageAlbSg = new ec2.SecurityGroup(this, "BrokerageAlbSg", {
+        vpc: brokerageVpc,
+        securityGroupName: "brokerage-mcp-alb-sg",
+        description:
+          "Public ALB for brokerage-mcp — open on :80, gated server-side by shared secret",
+        allowAllOutbound: true,
+      });
+      brokerageAlbSg.addIngressRule(
+        ec2.Peer.anyIpv4(),
+        ec2.Port.tcp(80),
+        "Public :80 (server-side shared-secret header check)",
+      );
+      brokerageTaskSg.addIngressRule(
+        brokerageAlbSg,
+        ec2.Port.tcp(8080),
+        "ALB → task on :8080",
+      );
+
+      brokerageSharedSecretRef = new secretsmanager.Secret(
+        this,
+        "BrokerageSharedSecret",
+        {
+          secretName: "brokerage/shared-secret",
+          description:
+            "Shared secret injected as X-Brokerage-Secret on every request. The MCP server rejects requests without it.",
+          generateSecretString: {
+            secretStringTemplate: JSON.stringify({}),
+            generateStringKey: "secret",
+            excludeCharacters: "\"'\\/@ ",
+            passwordLength: 48,
+          },
+        },
+      );
+      brokerageSharedSecretRef.grantRead(brokerageTaskDef.taskRole);
+      // Grant the AgentCore Runtime role + any already-created task role
+      // read on the shared secret — they fetch it at startup.
+      brokerageSharedSecretRef.grantRead(runtimeRole);
+      brokerageServerContainer.addSecret(
+        "BROKERAGE_SHARED_SECRET",
+        ecs.Secret.fromSecretsManager(brokerageSharedSecretRef, "secret"),
+      );
+
+      const brokerageService = new ecs.FargateService(this, "BrokerageService", {
+        serviceName: "brokerage-mcp",
+        cluster: brokerageCluster,
+        taskDefinition: brokerageTaskDef,
+        desiredCount: 1,
+        platformVersion: ecs.FargatePlatformVersion.LATEST,
+        assignPublicIp: true,
+        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+        securityGroups: [brokerageTaskSg],
+        circuitBreaker: { rollback: true },
+      });
+
+      const brokerageAlb = new elbv2.ApplicationLoadBalancer(this, "BrokerageAlb", {
+        loadBalancerName: "brokerage-mcp-alb",
+        vpc: brokerageVpc,
+        internetFacing: true,
+        securityGroup: brokerageAlbSg,
+        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      });
+      const brokerageListener = brokerageAlb.addListener("BrokerageHttpListener", {
+        port: 80,
+        open: false,
+      });
+      brokerageListener.addTargets("BrokerageTargets", {
+        port: 8080,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        targets: [brokerageService],
+        healthCheck: {
+          path: "/health",
+          healthyHttpCodes: "200",
+          interval: cdk.Duration.seconds(30),
+        },
+        deregistrationDelay: cdk.Duration.seconds(15),
+      });
+
+      brokerageMcpUrl = `http://${brokerageAlb.loadBalancerDnsName}/mcp`;
+
+      // Proxy Lambda: Gateway target → ALB. Uses the tradingagents image
+      // ecr repo (same Python 3.12 runtime) and routes to
+      // /home/appuser/app/infra/lambdas/brokerage/handler.py.
+      if (agentCoreEnabled) {
+        brokerageProxyFn = new lambda.DockerImageFunction(this, "BrokerageProxyFn", {
+          functionName: "ta-mcp-brokerage",
+          code: lambda.DockerImageCode.fromEcr(ecrRepo, {
+            tagOrDigest: "latest",
+            cmd: ["handler.handler"],
+            entrypoint: ["/usr/local/bin/python", "-m", "awslambdaric"],
+            workingDirectory: "/home/appuser/app/infra/lambdas/brokerage",
+          }),
+          architecture: lambda.Architecture.ARM_64,
+          timeout: cdk.Duration.seconds(30),
+          memorySize: 512,
+          environment: {
+            BROKERAGE_MCP_URL: brokerageMcpUrl,
+            BROKERAGE_MCP_TIMEOUT: "20",
+            BROKERAGE_SHARED_SECRET_ID: "brokerage/shared-secret",
+          },
+          logRetention: logs.RetentionDays.ONE_MONTH,
+        });
+        brokerageSharedSecretRef.grantRead(brokerageProxyFn);
+      }
     }
 
     // ------------------------------------------------------------------
@@ -1139,6 +1515,14 @@ export class TradingAgentsStack extends cdk.Stack {
     if (osisIngestEndpoint) {
       new cdk.CfnOutput(this, "OsisPipelineIngestUrl", {
         value: osisIngestEndpoint,
+      });
+    }
+    if (brokerageMcpUrl) {
+      new cdk.CfnOutput(this, "BrokerageMcpUrl", { value: brokerageMcpUrl });
+    }
+    if (brokerageEcrRepo) {
+      new cdk.CfnOutput(this, "BrokerageEcrRepoUri", {
+        value: brokerageEcrRepo.repositoryUri,
       });
     }
   }

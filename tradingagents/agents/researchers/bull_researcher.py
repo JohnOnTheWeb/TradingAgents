@@ -20,6 +20,7 @@ Key points to focus on:
 - Positive Indicators: Use financial health, industry trends, and recent positive news as evidence.
 - Bear Counterpoints: Critically analyze the bear argument with specific data and sound reasoning, addressing concerns thoroughly and showing why the bull perspective holds stronger merit.
 - Engagement: Present your argument in a conversational style, engaging directly with the bear analyst's points and debating effectively rather than just listing data.
+- Options-market confirmation: if the analyst reports reference IV rank (IVR), IV-HV spread, liquidity rank, or borrow rate from the brokerage feed, cite them concretely. Low IVR + rising call open interest is a constructive confirmation; a deeply positive IV-HV spread (options rich vs realized) can still support an upside thesis if you frame it as option sellers underwriting the move.
 
 Resources available:
 Market research report: {market_research_report}

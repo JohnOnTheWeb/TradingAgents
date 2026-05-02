@@ -18,6 +18,18 @@ from tradingagents.agents.utils.news_data_tools import (
     get_insider_transactions,
     get_global_news
 )
+from tradingagents.agents.utils.brokerage_tools import (
+    get_vol_regime,
+    get_term_structure,
+    get_options_chain,
+    get_earnings_context,
+    get_liquidity,
+    get_historical_vol,
+    get_corporate_events,
+    get_brokerage_quote,
+    get_movers,
+    search_instruments,
+)
 
 
 def get_language_instruction() -> str:

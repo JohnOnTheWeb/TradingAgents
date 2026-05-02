@@ -1,3 +1,6 @@
+# Local brokerage OAuth tokens — never commit
+.brokerage-tokens.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -158,8 +161,9 @@ ENV/
 env.bak/
 venv.bak/
 
-# Claude Code local settings
-.claude/
+# Claude Code local settings — ignore everything under .claude/ EXCEPT skills/.
+.claude/*
+!.claude/skills/
 
 # Generated analysis reports
 reports/

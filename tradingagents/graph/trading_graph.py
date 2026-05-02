@@ -35,7 +35,14 @@ from tradingagents.agents.utils.agent_utils import (
     get_income_statement,
     get_news,
     get_insider_transactions,
-    get_global_news
+    get_global_news,
+    get_brokerage_quote,
+    get_corporate_events,
+    get_earnings_context,
+    get_liquidity,
+    get_movers,
+    get_vol_regime,
+    search_instruments,
 )
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -157,37 +164,47 @@ class TradingAgentsGraph:
         return kwargs
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
-        """Create tool nodes for different data sources using abstract methods."""
+        """Create tool nodes for different data sources using abstract methods.
+
+        Brokerage tools (get_brokerage_quote, get_vol_regime, etc.) degrade to a
+        structured "unavailable" response when BROKERAGE_MCP_URL is unset, so
+        including them here is safe even without the brokerage-mcp sidecar.
+        """
         return {
             "market": ToolNode(
                 [
-                    # Core stock data tools
                     get_stock_data,
-                    # Technical indicators
                     get_indicators,
+                    get_brokerage_quote,
+                    get_movers,
                 ]
             ),
             "social": ToolNode(
                 [
-                    # News tools for social media analysis
                     get_news,
+                    get_liquidity,
+                    get_vol_regime,
                 ]
             ),
             "news": ToolNode(
                 [
-                    # News and insider information
                     get_news,
                     get_global_news,
                     get_insider_transactions,
+                    get_earnings_context,
+                    get_corporate_events,
                 ]
             ),
             "fundamentals": ToolNode(
                 [
-                    # Fundamental analysis tools
                     get_fundamentals,
                     get_balance_sheet,
                     get_cashflow,
                     get_income_statement,
+                    get_liquidity,
+                    get_vol_regime,
+                    get_corporate_events,
+                    search_instruments,
                 ]
             ),
         }

@@ -1,0 +1,1 @@
+# Handler uses only stdlib (urllib, json). No runtime deps.

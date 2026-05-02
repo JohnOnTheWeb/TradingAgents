@@ -113,4 +113,14 @@ NagSuppressions.addStackSuppressions(stack, [
     reason:
       "Slow-log publishing doubles CloudWatch Logs cost for a single-node observability tool where operators can query the domain directly. OSIS pipeline already publishes its own logs for the ingest path.",
   },
+  {
+    id: "AwsSolutions-ELB2",
+    reason:
+      "Brokerage-MCP ALB access logs are disabled; the upstream Fargate container already logs every /mcp call to CloudWatch with tool name + latency, so ALB-level logs duplicate state without adding forensic value.",
+  },
+  {
+    id: "AwsSolutions-EC23",
+    reason:
+      "Brokerage-MCP ALB security group allows 0.0.0.0/0 on :80 by design — AgentCore Runtime runs as a managed public service (NetworkMode: PUBLIC) that cannot reach an internal ALB. Access is gated by a shared-secret header checked by the MCP server (BROKERAGE_SHARED_SECRET); only clients with the secret from Secrets Manager can call /mcp.",
+  },
 ]);
