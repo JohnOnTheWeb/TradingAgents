@@ -81,7 +81,12 @@ def _safe_route(method_name: str, *args, **kwargs) -> str:
 
 
 def _cached(tool: str, args: Dict[str, Any], producer) -> Any:
-    from cache import cached_call
+    # The Lambda's LAMBDA_TASK_ROOT is /var/task; the handler sits at
+    # /var/task/infra/lambdas/data_tools/handler.py. Python's sys.path
+    # includes /var/task but NOT the handler's own directory, so
+    # `from cache import ...` (a sibling file) doesn't resolve.
+    # Use the package-qualified import.
+    from infra.lambdas.data_tools.cache import cached_call
     return cached_call(tool, args, producer)
 
 
