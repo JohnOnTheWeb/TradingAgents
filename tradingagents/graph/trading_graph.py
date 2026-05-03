@@ -323,8 +323,28 @@ class TradingAgentsGraph:
         """Execute the graph and write the resulting state to disk and memory log."""
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
+
+        # Phase 2 prefetch: run the high-frequency data-tools in parallel
+        # once at the start of the run. Analysts are instructed to prefer
+        # this context over calling tools. Runs under the Lambda-side
+        # cache from Phase 1, so repeated runs are fast.
+        prefetched_context = ""
+        try:
+            from tradingagents.graph.prefetch import fetch_bundle, render_bundle_for_prompt
+            bundle = fetch_bundle(company_name, str(trade_date))
+            prefetched_context = render_bundle_for_prompt(bundle)
+            logger.info(
+                "prefetch complete for %s: %d items, %d chars",
+                company_name, len(bundle), len(prefetched_context),
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.warning("prefetch failed for %s: %s", company_name, err)
+
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date, past_context=past_context
+            company_name,
+            trade_date,
+            past_context=past_context,
+            prefetched_context=prefetched_context,
         )
         args = self.propagator.get_graph_args()
 

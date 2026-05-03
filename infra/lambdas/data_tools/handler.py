@@ -80,8 +80,17 @@ def _safe_route(method_name: str, *args, **kwargs) -> str:
         return f"[{method_name} unavailable: {type(err).__name__}: {err}]"
 
 
+def _cached(tool: str, args: Dict[str, Any], producer) -> Any:
+    from cache import cached_call
+    return cached_call(tool, args, producer)
+
+
 def _get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
-    return _safe_route("get_stock_data", symbol, start_date, end_date)
+    return _cached(
+        "get_stock_data",
+        {"symbol": symbol, "start_date": start_date, "end_date": end_date},
+        lambda: _safe_route("get_stock_data", symbol, start_date, end_date),
+    )
 
 
 def _get_indicators(
@@ -95,47 +104,71 @@ def _get_indicators(
         return ""
     results = []
     for ind in indicators:
-        results.append(
-            _safe_route("get_indicators", symbol, ind, curr_date, look_back_days)
-        )
+        results.append(_cached(
+            "get_indicators",
+            {"symbol": symbol, "indicator": ind, "curr_date": curr_date, "look_back_days": look_back_days},
+            lambda ind=ind: _safe_route("get_indicators", symbol, ind, curr_date, look_back_days),
+        ))
     return "\n\n".join(results)
 
 
 def _get_fundamentals(ticker: str, curr_date: str) -> str:
-    return _safe_route("get_fundamentals", ticker, curr_date)
+    return _cached(
+        "get_fundamentals",
+        {"ticker": ticker, "curr_date": curr_date},
+        lambda: _safe_route("get_fundamentals", ticker, curr_date),
+    )
 
 
 def _get_balance_sheet(ticker: str, freq: str = "quarterly", curr_date: Any = None) -> str:
-    return _safe_route("get_balance_sheet", ticker, freq, curr_date)
+    return _cached(
+        "get_balance_sheet",
+        {"ticker": ticker, "freq": freq, "curr_date": curr_date},
+        lambda: _safe_route("get_balance_sheet", ticker, freq, curr_date),
+    )
 
 
 def _get_cashflow(ticker: str, freq: str = "quarterly", curr_date: Any = None) -> str:
-    return _safe_route("get_cashflow", ticker, freq, curr_date)
+    return _cached(
+        "get_cashflow",
+        {"ticker": ticker, "freq": freq, "curr_date": curr_date},
+        lambda: _safe_route("get_cashflow", ticker, freq, curr_date),
+    )
 
 
 def _get_income_statement(ticker: str, freq: str = "quarterly", curr_date: Any = None) -> str:
-    return _safe_route("get_income_statement", ticker, freq, curr_date)
+    return _cached(
+        "get_income_statement",
+        {"ticker": ticker, "freq": freq, "curr_date": curr_date},
+        lambda: _safe_route("get_income_statement", ticker, freq, curr_date),
+    )
 
 
 def _get_news(ticker: str, start_date: str, end_date: str) -> str:
-    return _safe_route("get_news", ticker, start_date, end_date)
+    return _cached(
+        "get_news",
+        {"ticker": ticker, "start_date": start_date, "end_date": end_date},
+        lambda: _safe_route("get_news", ticker, start_date, end_date),
+    )
 
 
 def _get_insider_transactions(ticker: str) -> str:
-    return _safe_route("get_insider_transactions", ticker)
+    return _cached(
+        "get_insider_transactions",
+        {"ticker": ticker},
+        lambda: _safe_route("get_insider_transactions", ticker),
+    )
 
 
 def _get_global_news(curr_date: str, look_back_days: int = 7, limit: int = 5) -> str:
-    return _safe_route("get_global_news", curr_date, look_back_days, limit)
+    return _cached(
+        "get_global_news",
+        {"curr_date": curr_date, "look_back_days": look_back_days, "limit": limit},
+        lambda: _safe_route("get_global_news", curr_date, look_back_days, limit),
+    )
 
 
-def _get_returns(ticker: str, trade_date: str, holding_days: int = 5) -> Dict[str, Any]:
-    """Realised raw + SPY-alpha returns over a holding window.
-
-    Returns ``{"raw_return", "alpha_return", "actual_holding_days", "note"?}``.
-    When no data is available, returns a dict with a ``note`` key and zero
-    returns so callers can degrade gracefully.
-    """
+def _compute_returns(ticker: str, trade_date: str, holding_days: int) -> Dict[str, Any]:
     import yfinance as yf
     from datetime import datetime, timedelta
 
@@ -176,6 +209,18 @@ def _get_returns(ticker: str, trade_date: str, holding_days: int = 5) -> Dict[st
         "alpha_return": raw - bench,
         "actual_holding_days": actual,
     }
+
+
+def _get_returns(ticker: str, trade_date: str, holding_days: int = 5) -> Dict[str, Any]:
+    """Realised raw + SPY-alpha returns over a holding window.
+
+    Returns ``{"raw_return", "alpha_return", "actual_holding_days", "note"?}``.
+    """
+    return _cached(
+        "get_returns",
+        {"ticker": ticker, "trade_date": trade_date, "holding_days": holding_days},
+        lambda: _compute_returns(ticker, trade_date, holding_days),
+    )
 
 
 _DISPATCH: Dict[str, Callable[..., Any]] = {

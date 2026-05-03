@@ -29,6 +29,7 @@ def create_news_analyst(llm):
             + get_language_instruction()
         )
 
+        prefetched_context = state.get("prefetched_context") or ""
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -40,7 +41,10 @@ def create_news_analyst(llm):
                     " If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** or deliverable,"
                     " prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop."
                     " You have access to the following tools: {tool_names}.\n{system_message}"
-                    "For your reference, the current date is {current_date}. {instrument_context}",
+                    "For your reference, the current date is {current_date}. {instrument_context}"
+                    "\n\n{prefetched_context}"
+                    "\n\nIMPORTANT: The pre-fetched context above was retrieved just now — prefer reading from it over calling tools."
+                    " Only call a tool if the specific data you need is not present above.",
                 ),
                 MessagesPlaceholder(variable_name="messages"),
             ]
@@ -50,6 +54,7 @@ def create_news_analyst(llm):
         prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
+        prompt = prompt.partial(prefetched_context=prefetched_context)
 
         chain = prompt | llm.bind_tools(tools)
         result = chain.invoke(state["messages"])

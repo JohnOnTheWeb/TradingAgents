@@ -71,3 +71,4 @@ class AgentState(MessagesState):
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]
+    prefetched_context: Annotated[str, "Rendered data-tools + brokerage bundle fetched once at run start"]

@@ -97,6 +97,17 @@ export class TradingAgentsStack extends cdk.Stack {
       sortKey: { name: "trade_date", type: dynamodb.AttributeType.STRING },
     });
 
+    // Tool-result cache. Memoises data-tools responses so same-day re-runs
+    // and intra-run repeated calls skip the vendor. DynamoDB native TTL
+    // attribute `ttl` expires rows automatically (epoch seconds).
+    const toolCacheTable = new dynamodb.Table(this, "ToolCacheTable", {
+      tableName: "ta-tool-cache",
+      partitionKey: { name: "cache_key", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: "ttl",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     const configBucket = new s3.Bucket(this, "ConfigBucket", {
       bucketName: `ta-config-${this.account}`,
       versioned: true,
@@ -549,10 +560,23 @@ export class TradingAgentsStack extends cdk.Stack {
           TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
           TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
           ALPHA_VANTAGE_SECRET_ID: "tradingagents/alpha-vantage-api-key",
+          TOOL_CACHE_TABLE: toolCacheTable.tableName,
         },
         logRetention: logs.RetentionDays.ONE_MONTH,
       });
       alphaVantageSecret.grantRead(dataToolsFn);
+      toolCacheTable.grantReadWriteData(dataToolsFn);
+      dataToolsFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["cloudwatch:PutMetricData"],
+          resources: ["*"],
+          conditions: {
+            StringEquals: {
+              "cloudwatch:namespace": "TradingAgents/ToolCache",
+            },
+          },
+        }),
+      );
 
       memoryLogFn = new lambda.DockerImageFunction(this, "MemoryLogFn", {
         functionName: "ta-mcp-memory-log",
