@@ -45,6 +45,13 @@ COPY --from=builder --chown=appuser:appuser /build /home/appuser/app
 # find the handler files via WorkingDirectory.
 COPY --chown=appuser:appuser infra/lambdas /home/appuser/app/infra/lambdas
 
+# Buildx layer caching has been seen to drop exec bits on copied binaries.
+# Re-assert them so /usr/local/bin/python* and /opt/venv/bin/python* remain
+# executable by appuser. Without this, Lambda's awslambdaric entrypoint
+# fails with "fork/exec permission denied".
+RUN chmod a+rx /usr/local/bin/python* /opt/venv/bin/python* \
+    && chmod -R a+rX /opt/venv/lib
+
 USER appuser
 WORKDIR /home/appuser/app
 

@@ -529,7 +529,7 @@ export class TradingAgentsStack extends cdk.Stack {
           tagOrDigest: "latest",
           cmd: ["handler.handler"],
           entrypoint: [
-            "/usr/local/bin/python",
+            "/opt/venv/bin/python",
             "-m",
             "awslambdaric",
           ],
@@ -551,7 +551,7 @@ export class TradingAgentsStack extends cdk.Stack {
           tagOrDigest: "latest",
           cmd: ["handler.handler"],
           entrypoint: [
-            "/usr/local/bin/python",
+            "/opt/venv/bin/python",
             "-m",
             "awslambdaric",
           ],
@@ -1214,7 +1214,7 @@ export class TradingAgentsStack extends cdk.Stack {
           code: lambda.DockerImageCode.fromEcr(ecrRepo, {
             tagOrDigest: "latest",
             cmd: ["handler.handler"],
-            entrypoint: ["/usr/local/bin/python", "-m", "awslambdaric"],
+            entrypoint: ["/opt/venv/bin/python", "-m", "awslambdaric"],
             workingDirectory: "/home/appuser/app/infra/lambdas/brokerage",
           }),
           architecture: lambda.Architecture.ARM_64,
