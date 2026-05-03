@@ -131,8 +131,19 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
+import logging as _logging
+_route_logger = _logging.getLogger(__name__)
+
+
 def route_to_vendor(method: str, *args, **kwargs):
-    """Route method calls to appropriate vendor implementation with fallback support."""
+    """Route method calls to the configured vendor with fallback support.
+
+    Fallback triggers on ANY exception from a vendor implementation — rate
+    limits, missing credentials, transport errors, unexpected response
+    shapes, everything. Only the final failure (after all vendors have
+    been tried) raises. The configured primary vendor is tried first, then
+    every other registered vendor in catalog order.
+    """
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
@@ -147,6 +158,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
+    errors: list[str] = []
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -156,7 +168,20 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+        except AlphaVantageRateLimitError as err:
+            # Expected fallback path (rate limit / missing key / transport);
+            # informational log only.
+            _route_logger.info("vendor %s for %s falling back: %s", vendor, method, err)
+            errors.append(f"{vendor}: {err}")
+        except Exception as err:  # noqa: BLE001
+            # Unexpected error from a vendor — log with stack, still fall back.
+            _route_logger.warning(
+                "vendor %s for %s raised %s; falling back",
+                vendor, method, err, exc_info=True,
+            )
+            errors.append(f"{vendor}: {type(err).__name__}: {err}")
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    raise RuntimeError(
+        f"No available vendor for '{method}' — tried {len(errors)}: "
+        + "; ".join(errors)
+    )

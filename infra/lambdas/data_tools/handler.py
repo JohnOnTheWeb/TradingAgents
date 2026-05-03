@@ -56,9 +56,32 @@ def _split_indicators(indicator: str) -> list[str]:
     return [i.strip().lower() for i in str(indicator).split(",") if i.strip()]
 
 
-def _get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
+def _safe_route(method_name: str, *args, **kwargs) -> str:
+    """route_to_vendor wrapper that NEVER raises for recoverable errors.
+
+    If all vendors fail (rate limits, missing keys, transport errors, upstream
+    5xx), returns a human-readable degraded string instead of propagating
+    RuntimeError up through the Lambda. This keeps the Gateway response a
+    normal 200 and lets the analyst LLM see a parseable tool result rather
+    than hitting LangGraph's recursion limit retrying a crashing tool.
+    """
     from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_stock_data", symbol, start_date, end_date)
+    try:
+        return route_to_vendor(method_name, *args, **kwargs)
+    except RuntimeError as err:
+        logger.warning("%s: all vendors exhausted: %s", method_name, err)
+        return f"[{method_name} unavailable: all vendors failed — {err}]"
+    except ValueError as err:
+        # e.g. method not in the catalog. Surface clearly.
+        logger.warning("%s: %s", method_name, err)
+        return f"[{method_name} unavailable: {err}]"
+    except Exception as err:  # noqa: BLE001
+        logger.error("%s: unexpected error %s", method_name, err, exc_info=True)
+        return f"[{method_name} unavailable: {type(err).__name__}: {err}]"
+
+
+def _get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
+    return _safe_route("get_stock_data", symbol, start_date, end_date)
 
 
 def _get_indicators(
@@ -67,54 +90,43 @@ def _get_indicators(
     curr_date: str,
     look_back_days: int = 30,
 ) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
     indicators = _split_indicators(indicator)
     if not indicators:
         return ""
     results = []
     for ind in indicators:
-        try:
-            results.append(
-                route_to_vendor("get_indicators", symbol, ind, curr_date, look_back_days)
-            )
-        except ValueError as err:
-            results.append(str(err))
+        results.append(
+            _safe_route("get_indicators", symbol, ind, curr_date, look_back_days)
+        )
     return "\n\n".join(results)
 
 
 def _get_fundamentals(ticker: str, curr_date: str) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_fundamentals", ticker, curr_date)
+    return _safe_route("get_fundamentals", ticker, curr_date)
 
 
 def _get_balance_sheet(ticker: str, freq: str = "quarterly", curr_date: Any = None) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_balance_sheet", ticker, freq, curr_date)
+    return _safe_route("get_balance_sheet", ticker, freq, curr_date)
 
 
 def _get_cashflow(ticker: str, freq: str = "quarterly", curr_date: Any = None) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_cashflow", ticker, freq, curr_date)
+    return _safe_route("get_cashflow", ticker, freq, curr_date)
 
 
 def _get_income_statement(ticker: str, freq: str = "quarterly", curr_date: Any = None) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+    return _safe_route("get_income_statement", ticker, freq, curr_date)
 
 
 def _get_news(ticker: str, start_date: str, end_date: str) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_news", ticker, start_date, end_date)
+    return _safe_route("get_news", ticker, start_date, end_date)
 
 
 def _get_insider_transactions(ticker: str) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_insider_transactions", ticker)
+    return _safe_route("get_insider_transactions", ticker)
 
 
 def _get_global_news(curr_date: str, look_back_days: int = 7, limit: int = 5) -> str:
-    from tradingagents.dataflows.interface import route_to_vendor
-    return route_to_vendor("get_global_news", curr_date, look_back_days, limit)
+    return _safe_route("get_global_news", curr_date, look_back_days, limit)
 
 
 def _get_returns(ticker: str, trade_date: str, holding_days: int = 5) -> Dict[str, Any]:

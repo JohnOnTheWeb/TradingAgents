@@ -1,3 +1,4 @@
+import logging
 import os
 import requests
 import pandas as pd
@@ -5,7 +6,10 @@ import json
 from datetime import datetime
 from io import StringIO
 
+logger = logging.getLogger(__name__)
+
 API_BASE_URL = "https://www.alphavantage.co/query"
+_DEFAULT_TIMEOUT = float(os.environ.get("ALPHA_VANTAGE_TIMEOUT", "15"))
 
 def get_api_key() -> str:
     """Retrieve the API key for Alpha Vantage from environment variables."""
@@ -36,49 +40,78 @@ def format_datetime_for_api(date_input) -> str:
         raise ValueError(f"Date must be string or datetime object, got {type(date_input)}")
 
 class AlphaVantageRateLimitError(Exception):
-    """Exception raised when Alpha Vantage API rate limit is exceeded."""
+    """Raised for ANY Alpha Vantage condition that should trigger fallback:
+    rate limit, missing/invalid key, transport errors, timeout, 4xx/5xx,
+    or an error-shaped JSON envelope. The name is kept for backwards
+    compatibility with route_to_vendor's except-clause.
+    """
     pass
+
 
 def _make_api_request(function_name: str, params: dict) -> dict | str:
     """Helper function to make API requests and handle responses.
-    
+
     Raises:
-        AlphaVantageRateLimitError: When API rate limit is exceeded
+        AlphaVantageRateLimitError: For any condition that should cause the
+            vendor router to fall back to the next vendor (missing key,
+            rate limit, timeout, 4xx/5xx, malformed response).
     """
+    # Resolve API key up front; missing key = fallback, not hard crash.
+    try:
+        api_key = get_api_key()
+    except ValueError as err:
+        raise AlphaVantageRateLimitError(str(err)) from err
+
     # Create a copy of params to avoid modifying the original
     api_params = params.copy()
     api_params.update({
         "function": function_name,
-        "apikey": get_api_key(),
+        "apikey": api_key,
         "source": "trading_agents",
     })
-    
+
     # Handle entitlement parameter if present in params or global variable
     current_entitlement = globals().get('_current_entitlement')
     entitlement = api_params.get("entitlement") or current_entitlement
-    
+
     if entitlement:
         api_params["entitlement"] = entitlement
     elif "entitlement" in api_params:
         # Remove entitlement if it's None or empty
         api_params.pop("entitlement", None)
-    
-    response = requests.get(API_BASE_URL, params=api_params)
-    response.raise_for_status()
+
+    try:
+        response = requests.get(API_BASE_URL, params=api_params, timeout=_DEFAULT_TIMEOUT)
+    except requests.exceptions.RequestException as err:
+        # Timeout, DNS failure, connection reset — fall back.
+        raise AlphaVantageRateLimitError(f"Alpha Vantage transport error: {err}") from err
+
+    if response.status_code >= 400:
+        # 4xx/5xx — fall back. Body is usually a short JSON or HTML error.
+        body = (response.text or "")[:200]
+        raise AlphaVantageRateLimitError(
+            f"Alpha Vantage HTTP {response.status_code}: {body!r}"
+        )
 
     response_text = response.text
-    
+
     # Check if response is JSON (error responses are typically JSON)
     try:
         response_json = json.loads(response_text)
-        # Check for rate limit error
-        if "Information" in response_json:
-            info_message = response_json["Information"]
-            if "rate limit" in info_message.lower() or "api key" in info_message.lower():
-                raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {info_message}")
     except json.JSONDecodeError:
-        # Response is not JSON (likely CSV data), which is normal
-        pass
+        # Response is not JSON (likely CSV data), which is normal.
+        return response_text
+
+    if isinstance(response_json, dict):
+        # Alpha Vantage packs various error conditions into different keys;
+        # treat every one of them as a fallback trigger rather than returning
+        # the error object as if it were data.
+        for err_key in ("Information", "Note", "Error Message", "Message"):
+            val = response_json.get(err_key)
+            if isinstance(val, str) and val.strip():
+                raise AlphaVantageRateLimitError(
+                    f"Alpha Vantage {err_key}: {val}"
+                )
 
     return response_text
 
