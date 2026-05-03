@@ -725,14 +725,75 @@ export class TradingAgentsStack extends cdk.Stack {
       // every MCP Lambda target. Kept intentionally minimal: ticker + date
       // where applicable. The Lambdas accept additional fields but Gateway
       // only advertises these to agent clients.
-      const dateInput = {
+      // Input schemas MUST match the actual handler signatures in
+      // infra/lambdas/data_tools/handler.py. The Gateway validates request
+      // arguments against these schemas BEFORE invoking the Lambda — a
+      // mismatch results in a ValidationException and zero Lambda hits.
+      const stockDataInput = {
         Type: "object",
         Properties: {
-          ticker: { Type: "string", Description: "Stock ticker symbol" },
-          trade_date: {
-            Type: "string",
-            Description: "ISO trade date, YYYY-MM-DD",
-          },
+          symbol: { Type: "string", Description: "Ticker symbol" },
+          start_date: { Type: "string", Description: "YYYY-MM-DD" },
+          end_date: { Type: "string", Description: "YYYY-MM-DD" },
+        },
+        Required: ["symbol", "start_date", "end_date"],
+      };
+      const indicatorsInput = {
+        Type: "object",
+        Properties: {
+          symbol: { Type: "string", Description: "Ticker symbol" },
+          indicator: { Type: "string", Description: "Indicator name (rsi, macd, ...)" },
+          curr_date: { Type: "string", Description: "Current trading date YYYY-MM-DD" },
+          look_back_days: { Type: "integer", Description: "Days to look back (default 30)" },
+        },
+        Required: ["symbol", "indicator", "curr_date"],
+      };
+      const fundamentalsInput = {
+        Type: "object",
+        Properties: {
+          ticker: { Type: "string" },
+          curr_date: { Type: "string", Description: "YYYY-MM-DD" },
+        },
+        Required: ["ticker", "curr_date"],
+      };
+      const statementInput = {
+        Type: "object",
+        Properties: {
+          ticker: { Type: "string" },
+          freq: { Type: "string", Description: "quarterly | annual" },
+          curr_date: { Type: "string", Description: "YYYY-MM-DD" },
+        },
+        Required: ["ticker"],
+      };
+      const newsInput = {
+        Type: "object",
+        Properties: {
+          ticker: { Type: "string" },
+          start_date: { Type: "string", Description: "YYYY-MM-DD" },
+          end_date: { Type: "string", Description: "YYYY-MM-DD" },
+        },
+        Required: ["ticker", "start_date", "end_date"],
+      };
+      const globalNewsInput = {
+        Type: "object",
+        Properties: {
+          curr_date: { Type: "string", Description: "YYYY-MM-DD" },
+          look_back_days: { Type: "integer" },
+          limit: { Type: "integer" },
+        },
+        Required: ["curr_date"],
+      };
+      const insiderInput = {
+        Type: "object",
+        Properties: { ticker: { Type: "string" } },
+        Required: ["ticker"],
+      };
+      const returnsInput = {
+        Type: "object",
+        Properties: {
+          ticker: { Type: "string" },
+          trade_date: { Type: "string", Description: "YYYY-MM-DD" },
+          holding_days: { Type: "integer" },
         },
         Required: ["ticker", "trade_date"],
       };
@@ -757,71 +818,54 @@ export class TradingAgentsStack extends cdk.Stack {
                     InlinePayload: [
                       {
                         Name: "get_stock_data",
-                        Description: "OHLCV price history for a ticker",
-                        InputSchema: dateInput,
+                        Description: "OHLCV price history for a ticker over a date range",
+                        InputSchema: stockDataInput,
                       },
                       {
                         Name: "get_indicators",
-                        Description: "Technical indicators (MACD, RSI, etc.)",
-                        InputSchema: dateInput,
+                        Description: "Single technical indicator (MACD, RSI, ...)",
+                        InputSchema: indicatorsInput,
                       },
                       {
                         Name: "get_fundamentals",
                         Description: "Company fundamentals summary",
-                        InputSchema: dateInput,
+                        InputSchema: fundamentalsInput,
                       },
                       {
                         Name: "get_balance_sheet",
                         Description: "Latest balance-sheet items",
-                        InputSchema: dateInput,
+                        InputSchema: statementInput,
                       },
                       {
                         Name: "get_cashflow",
                         Description: "Cash-flow statement summary",
-                        InputSchema: dateInput,
+                        InputSchema: statementInput,
                       },
                       {
                         Name: "get_income_statement",
                         Description: "Income statement summary",
-                        InputSchema: dateInput,
+                        InputSchema: statementInput,
                       },
                       {
                         Name: "get_news",
-                        Description: "Ticker-specific news headlines",
-                        InputSchema: dateInput,
+                        Description: "Ticker-specific news headlines for a date range",
+                        InputSchema: newsInput,
                       },
                       {
                         Name: "get_insider_transactions",
                         Description: "Recent insider trades",
-                        InputSchema: dateInput,
+                        InputSchema: insiderInput,
                       },
                       {
                         Name: "get_global_news",
-                        Description: "Top macro / global news",
-                        InputSchema: {
-                          Type: "object",
-                          Properties: {
-                            trade_date: {
-                              Type: "string",
-                              Description: "ISO trade date",
-                            },
-                          },
-                          Required: ["trade_date"],
-                        },
+                        Description: "Top macro / global news over a lookback window",
+                        InputSchema: globalNewsInput,
                       },
                       {
                         Name: "get_returns",
                         Description:
                           "Realised raw + SPY-alpha returns over a holding window, for outcome resolution",
-                        InputSchema: {
-                          Type: "object",
-                          Properties: {
-                            ticker: { Type: "string" },
-                            trade_date: { Type: "string", Description: "YYYY-MM-DD" },
-                            holding_days: { Type: "integer", Description: "Trading days to hold" },
-                          },
-                          Required: ["ticker", "trade_date"],
-                        },
+                        InputSchema: returnsInput,
                       },
                     ],
                   },
