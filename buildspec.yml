@@ -42,6 +42,19 @@ phases:
           --tag "$IMAGE_URI:$SHORT_SHA"
           --push
           .
+      # Second image: Lambda-specific layout using the official AWS
+      # Lambda Python base. The agentcore image above uses python:slim
+      # which produces binaries Lambda rejects as non-executable.
+      - docker buildx build
+          --platform "$IMAGE_PLATFORM"
+          --provenance=false
+          --no-cache
+          --pull
+          --file Dockerfile.lambda
+          --tag "$IMAGE_URI:lambda-latest"
+          --tag "$IMAGE_URI:lambda-$SHORT_SHA"
+          --push
+          .
 
   post_build:
     commands:

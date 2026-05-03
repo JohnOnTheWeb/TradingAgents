@@ -523,18 +523,15 @@ export class TradingAgentsStack extends cdk.Stack {
     let memoryLogFn: lambda.DockerImageFunction | undefined;
 
     if (agentCoreEnabled) {
+      // MCP target Lambdas use the Lambda-native base image (:lambda-latest
+      // tag built by buildspec.yml from Dockerfile.lambda). AWS's base
+      // image has awslambdaric pre-installed and correct exec bits —
+      // avoids the python:slim-under-Lambda permission issue.
       dataToolsFn = new lambda.DockerImageFunction(this, "DataToolsFn", {
         functionName: "ta-mcp-data-tools",
         code: lambda.DockerImageCode.fromEcr(ecrRepo, {
-          tagOrDigest: "latest",
-          cmd: ["handler.handler"],
-          entrypoint: [
-            "/bin/sh",
-            "-c",
-            "exec /opt/venv/bin/python -m awslambdaric \"$@\"",
-            "--",
-          ],
-          workingDirectory: "/home/appuser/app/infra/lambdas/data_tools",
+          tagOrDigest: "lambda-latest",
+          cmd: ["infra.lambdas.data_tools.handler.handler"],
         }),
         architecture: lambda.Architecture.ARM_64,
         timeout: cdk.Duration.minutes(2),
@@ -549,15 +546,8 @@ export class TradingAgentsStack extends cdk.Stack {
       memoryLogFn = new lambda.DockerImageFunction(this, "MemoryLogFn", {
         functionName: "ta-mcp-memory-log",
         code: lambda.DockerImageCode.fromEcr(ecrRepo, {
-          tagOrDigest: "latest",
-          cmd: ["handler.handler"],
-          entrypoint: [
-            "/bin/sh",
-            "-c",
-            "exec /opt/venv/bin/python -m awslambdaric \"$@\"",
-            "--",
-          ],
-          workingDirectory: "/home/appuser/app/infra/lambdas/memory_log",
+          tagOrDigest: "lambda-latest",
+          cmd: ["infra.lambdas.memory_log.handler.handler"],
         }),
         architecture: lambda.Architecture.ARM_64,
         timeout: cdk.Duration.seconds(30),
@@ -1214,15 +1204,8 @@ export class TradingAgentsStack extends cdk.Stack {
         brokerageProxyFn = new lambda.DockerImageFunction(this, "BrokerageProxyFn", {
           functionName: "ta-mcp-brokerage",
           code: lambda.DockerImageCode.fromEcr(ecrRepo, {
-            tagOrDigest: "latest",
-            cmd: ["handler.handler"],
-            entrypoint: [
-              "/bin/sh",
-              "-c",
-              "exec /opt/venv/bin/python -m awslambdaric \"$@\"",
-              "--",
-            ],
-            workingDirectory: "/home/appuser/app/infra/lambdas/brokerage",
+            tagOrDigest: "lambda-latest",
+            cmd: ["infra.lambdas.brokerage.handler.handler"],
           }),
           architecture: lambda.Architecture.ARM_64,
           timeout: cdk.Duration.seconds(30),
