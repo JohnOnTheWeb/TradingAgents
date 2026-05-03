@@ -35,6 +35,8 @@ phases:
       - docker buildx build
           --platform "$IMAGE_PLATFORM"
           --provenance=false
+          --no-cache
+          --pull
           --file "$DOCKERFILE"
           --tag "$IMAGE_URI:latest"
           --tag "$IMAGE_URI:$SHORT_SHA"
