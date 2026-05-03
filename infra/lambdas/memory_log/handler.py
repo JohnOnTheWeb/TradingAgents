@@ -250,6 +250,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.warning("tool_name missing. event keys=%s", list(event.keys()))
         raise ValueError("tool_name is required")
 
+    if "___" in tool_name:
+        tool_name = tool_name.rsplit("___", 1)[-1]
+
     fn = _DISPATCH.get(tool_name)
     if fn is None:
         raise ValueError(

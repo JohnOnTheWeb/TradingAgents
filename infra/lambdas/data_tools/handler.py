@@ -167,6 +167,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.warning("tool_name missing. event keys=%s", list(event.keys()))
         raise ValueError("tool_name is required")
 
+    # Gateway delivers the fully-qualified name (e.g. "data-tools___get_stock_data")
+    # but dispatch keys are bare tool names ("get_stock_data").
+    if "___" in tool_name:
+        tool_name = tool_name.rsplit("___", 1)[-1]
+
     fn = _DISPATCH.get(tool_name)
     if fn is None:
         raise ValueError(
