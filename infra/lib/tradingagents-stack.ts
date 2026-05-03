@@ -523,6 +523,15 @@ export class TradingAgentsStack extends cdk.Stack {
     let memoryLogFn: lambda.DockerImageFunction | undefined;
 
     if (agentCoreEnabled) {
+      // Alpha Vantage API key — resolved at Lambda cold start from the
+      // existing secret. Import by name so destroy/recreate of the Lambda
+      // doesn't wipe the secret value.
+      const alphaVantageSecret = secretsmanager.Secret.fromSecretNameV2(
+        this,
+        "AlphaVantageApiKey",
+        "tradingagents/alpha-vantage-api-key",
+      );
+
       // MCP target Lambdas use the Lambda-native base image (:lambda-latest
       // tag built by buildspec.yml from Dockerfile.lambda). AWS's base
       // image has awslambdaric pre-installed and correct exec bits —
@@ -539,9 +548,11 @@ export class TradingAgentsStack extends cdk.Stack {
         environment: {
           TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
           TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
+          ALPHA_VANTAGE_SECRET_ID: "tradingagents/alpha-vantage-api-key",
         },
         logRetention: logs.RetentionDays.ONE_MONTH,
       });
+      alphaVantageSecret.grantRead(dataToolsFn);
 
       memoryLogFn = new lambda.DockerImageFunction(this, "MemoryLogFn", {
         functionName: "ta-mcp-memory-log",

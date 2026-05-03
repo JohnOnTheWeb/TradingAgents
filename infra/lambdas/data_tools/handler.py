@@ -9,12 +9,46 @@ in ``tradingagents.dataflows.interface``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Callable, Dict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+
+
+def _resolve_alpha_vantage_key() -> None:
+    """Populate ALPHA_VANTAGE_API_KEY from Secrets Manager at cold start.
+
+    Reads the secret id from ALPHA_VANTAGE_SECRET_ID and sets the env var
+    once so downstream code in tradingagents.dataflows.alpha_vantage_common
+    can call os.getenv without additional plumbing. Silent no-op when the
+    secret id isn't set or the key is already present.
+    """
+    if os.environ.get("ALPHA_VANTAGE_API_KEY"):
+        return
+    secret_id = (os.environ.get("ALPHA_VANTAGE_SECRET_ID") or "").strip()
+    if not secret_id:
+        return
+    try:
+        import boto3
+        raw = boto3.client("secretsmanager").get_secret_value(
+            SecretId=secret_id,
+        ).get("SecretString") or ""
+        # Allow either raw-string or {"api_key": "..."} shape.
+        try:
+            parsed = json.loads(raw)
+            key = str(parsed.get("api_key") or parsed.get("ALPHA_VANTAGE_API_KEY") or raw).strip()
+        except json.JSONDecodeError:
+            key = raw.strip()
+        if key:
+            os.environ["ALPHA_VANTAGE_API_KEY"] = key
+    except Exception as err:  # noqa: BLE001
+        logger.warning("failed to resolve ALPHA_VANTAGE_API_KEY from %s: %s", secret_id, err)
+
+
+_resolve_alpha_vantage_key()
 
 
 def _split_indicators(indicator: str) -> list[str]:
