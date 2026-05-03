@@ -146,10 +146,25 @@ _DISPATCH: Dict[str, Callable[..., Any]] = {
 }
 
 
-def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
-    tool_name = event.get("tool_name") or event.get("__name") or ""
-    args = event.get("tool_arguments") or event.get("arguments") or {}
+def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    # Gateway invokes Lambda with the tool NAME in the `BEDROCK_AGENTCORE_TOOL_NAME`
+    # context client context or in the event; the tool ARGUMENTS are splatted at
+    # the top level of the event. Support both the older explicit shape and the
+    # Gateway's actual shape.
+    tool_name = (
+        event.get("tool_name")
+        or event.get("__name")
+        or (context.client_context.custom.get("bedrockAgentCoreToolName")
+            if getattr(context, "client_context", None) and context.client_context
+            and getattr(context.client_context, "custom", None) else None)
+        or ""
+    )
+    args = event.get("tool_arguments") or event.get("arguments")
+    if args is None:
+        # Treat the event itself as the args dict, minus the meta keys.
+        args = {k: v for k, v in event.items() if k not in ("tool_name", "__name")}
     if not tool_name:
+        logger.warning("tool_name missing. event keys=%s", list(event.keys()))
         raise ValueError("tool_name is required")
 
     fn = _DISPATCH.get(tool_name)
