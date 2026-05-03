@@ -7,8 +7,6 @@ import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
 
-import yfinance as yf
-
 logger = logging.getLogger(__name__)
 
 from langgraph.prebuilt import ToolNode
@@ -216,36 +214,36 @@ class TradingAgentsGraph:
 
         Returns (raw_return, alpha_return, actual_holding_days) or
         (None, None, None) if price data is unavailable (too recent, delisted,
-        or network error).
+        or network error). Routed through the AgentCore Gateway
+        (``data-tools___get_returns``).
         """
+        from tradingagents.gateway_client import GatewayError, call
         try:
-            start = datetime.strptime(trade_date, "%Y-%m-%d")
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
-            end_str = end.strftime("%Y-%m-%d")
-
-            stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
-            spy = yf.Ticker("SPY").history(start=trade_date, end=end_str)
-
-            if len(stock) < 2 or len(spy) < 2:
-                return None, None, None
-
-            actual_days = min(holding_days, len(stock) - 1, len(spy) - 1)
-            raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
+            result = call(
+                "data-tools___get_returns",
+                {
+                    "ticker": ticker,
+                    "trade_date": trade_date,
+                    "holding_days": holding_days,
+                },
             )
-            spy_ret = float(
-                (spy["Close"].iloc[actual_days] - spy["Close"].iloc[0])
-                / spy["Close"].iloc[0]
-            )
-            alpha = raw - spy_ret
-            return raw, alpha, actual_days
-        except Exception as e:
+        except GatewayError as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s (will retry next run): %s",
                 ticker, trade_date, e,
             )
             return None, None, None
+
+        if not isinstance(result, dict):
+            return None, None, None
+        if result.get("note"):
+            # No data or insufficient window — treat as unresolved.
+            return None, None, None
+        return (
+            float(result.get("raw_return", 0.0)),
+            float(result.get("alpha_return", 0.0)),
+            int(result.get("actual_holding_days", 0)) or None,
+        )
 
     def _resolve_pending_entries(self, ticker: str) -> None:
         """Resolve pending log entries for ticker at the start of a new run.

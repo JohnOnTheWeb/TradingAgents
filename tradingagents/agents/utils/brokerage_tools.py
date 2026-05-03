@@ -1,89 +1,22 @@
-"""LangChain ``@tool`` wrappers over the brokerage-mcp sidecar.
+"""LangChain ``@tool`` wrappers over the brokerage target on the AgentCore Gateway.
 
-The sidecar is deployed as an internal Fargate service + ALB; its URL is
-injected into the AgentCore runtime + Fargate task as ``BROKERAGE_MCP_URL``.
-When the env var is unset (local dev / no brokerage config) every tool
+All calls flow through :mod:`tradingagents.gateway_client`; there is no
+direct-to-sidecar fallback. When the Gateway is unreachable every tool
 returns a structured "unavailable" stub so the analyst chain keeps running.
 
-All responses are the sidecar's envelope:
+Return envelope (unchanged from pre-Gateway contract):
     {"data": ..., "sources": {"schwab": "...", "tastytrade": "..."}}
 """
 
 from __future__ import annotations
 
-import json
-import logging
-import os
-import random
-import threading
-import time
-import urllib.error
-import urllib.request
-import uuid
 from typing import Annotated, Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-_logger = logging.getLogger(__name__)
+from tradingagents.gateway_client import GatewayError, call
 
-_DEFAULT_TIMEOUT = float(os.environ.get("BROKERAGE_MCP_TIMEOUT", "8"))
-_MAX_RETRIES = int(os.environ.get("BROKERAGE_MCP_MAX_RETRIES", "3"))
-# Process-wide circuit breaker: after repeated failures, short-circuit
-# subsequent calls for this many seconds so a dead sidecar doesn't block
-# every analyst ToolNode in a 15-way concurrent run.
-_CIRCUIT_COOLDOWN_SEC = float(os.environ.get("BROKERAGE_MCP_COOLDOWN", "120"))
-_CIRCUIT_FAIL_THRESHOLD = int(os.environ.get("BROKERAGE_MCP_FAIL_THRESHOLD", "3"))
-
-_cached_shared_secret: Optional[str] = None
-_circuit_lock = threading.Lock()
-_circuit_fails = 0
-_circuit_open_until = 0.0
-
-
-def _url() -> Optional[str]:
-    url = os.environ.get("BROKERAGE_MCP_URL", "").strip()
-    return url or None
-
-
-def _shared_secret() -> Optional[str]:
-    """Resolve the MCP shared-secret header value.
-
-    Order:
-      1. BROKERAGE_SHARED_SECRET env (local/dev).
-      2. Secrets Manager at BROKERAGE_SHARED_SECRET_ID, JSON key 'secret'.
-    """
-    global _cached_shared_secret
-    if _cached_shared_secret:
-        return _cached_shared_secret
-    inline = (os.environ.get("BROKERAGE_SHARED_SECRET") or "").strip()
-    if inline:
-        _cached_shared_secret = inline
-        return inline
-    secret_id = (os.environ.get("BROKERAGE_SHARED_SECRET_ID") or "").strip()
-    if not secret_id:
-        return None
-    try:
-        import boto3  # lazy
-        region = (
-            os.environ.get("AWS_REGION")
-            or os.environ.get("AWS_DEFAULT_REGION")
-            or "us-east-1"
-        )
-        resp = boto3.client("secretsmanager", region_name=region).get_secret_value(
-            SecretId=secret_id
-        )
-        raw = resp.get("SecretString") or ""
-        try:
-            parsed = json.loads(raw)
-            secret = str(parsed.get("secret") or raw).strip()
-        except json.JSONDecodeError:
-            secret = raw.strip()
-    except Exception as err:  # noqa: BLE001
-        _logger.warning("Failed to resolve BROKERAGE_SHARED_SECRET_ID=%s: %s", secret_id, err)
-        return None
-    if secret:
-        _cached_shared_secret = secret
-    return secret or None
+_TARGET = "brokerage"
 
 
 def _unavailable(reason: str) -> Dict[str, Any]:
@@ -94,114 +27,14 @@ def _unavailable(reason: str) -> Dict[str, Any]:
     }
 
 
-def _circuit_check() -> Optional[str]:
-    """Return a short-circuit reason if the breaker is open, else None."""
-    now = time.monotonic()
-    with _circuit_lock:
-        if now < _circuit_open_until:
-            return f"brokerage circuit open (cooling down {_circuit_open_until - now:.0f}s)"
-    return None
-
-
-def _circuit_record_failure() -> None:
-    global _circuit_fails, _circuit_open_until
-    with _circuit_lock:
-        _circuit_fails += 1
-        if _circuit_fails >= _CIRCUIT_FAIL_THRESHOLD:
-            _circuit_open_until = time.monotonic() + _CIRCUIT_COOLDOWN_SEC
-            _circuit_fails = 0
-            _logger.warning(
-                "brokerage-mcp circuit breaker opened for %.0fs after repeated failures",
-                _CIRCUIT_COOLDOWN_SEC,
-            )
-
-
-def _circuit_record_success() -> None:
-    global _circuit_fails
-    with _circuit_lock:
-        _circuit_fails = 0
-
-
-def _do_request(req: urllib.request.Request) -> str:
-    with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as resp:
-        return resp.read().decode("utf-8")
-
-
 def _call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    url = _url()
-    if not url:
-        return _unavailable("BROKERAGE_MCP_URL not configured")
-
-    circuit_reason = _circuit_check()
-    if circuit_reason:
-        return _unavailable(circuit_reason)
-
-    payload = {
-        "jsonrpc": "2.0",
-        "id": str(uuid.uuid4()),
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-    }
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    secret = _shared_secret()
-    if secret:
-        headers["X-Brokerage-Secret"] = secret
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-
-    last_error = "unknown"
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            raw = _do_request(req)
-            break
-        except urllib.error.HTTPError as err:
-            detail = err.read().decode("utf-8", errors="replace")[:200]
-            last_error = f"HTTP {err.code}"
-            # 4xx responses other than 429 won't improve by retrying — bail fast.
-            if err.code != 429 and 400 <= err.code < 500:
-                _logger.warning("brokerage-mcp %s for %s: %s", last_error, tool_name, detail)
-                _circuit_record_failure()
-                return _unavailable(last_error)
-            _logger.warning(
-                "brokerage-mcp %s for %s attempt %d/%d: %s",
-                last_error, tool_name, attempt, _MAX_RETRIES, detail,
-            )
-        except urllib.error.URLError as err:
-            last_error = f"unreachable: {err.reason}"
-            _logger.warning(
-                "brokerage-mcp %s for %s attempt %d/%d",
-                last_error, tool_name, attempt, _MAX_RETRIES,
-            )
-        except (TimeoutError, OSError) as err:
-            last_error = f"transport: {err}"
-            _logger.warning(
-                "brokerage-mcp %s for %s attempt %d/%d",
-                last_error, tool_name, attempt, _MAX_RETRIES,
-            )
-        if attempt < _MAX_RETRIES:
-            # Small jittered backoff: 0.3, 0.6, 1.2s +/- 25%.
-            delay = 0.3 * (2 ** (attempt - 1))
-            time.sleep(delay + random.uniform(0, delay * 0.25))
-    else:
-        _circuit_record_failure()
-        return _unavailable(last_error)
-
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        _circuit_record_failure()
-        return _unavailable("non-JSON response")
-    if "error" in parsed:
-        # RPC-level error (not a transport error) — record so repeated
-        # protocol-level problems still trip the breaker.
-        _circuit_record_failure()
-        return _unavailable(f"rpc error: {parsed['error']}")
-    _circuit_record_success()
-    result = parsed.get("result") or {}
-    content = result.get("content") or []
-    if content and content[0].get("type") == "json":
-        return content[0].get("json", {})
-    return {"data": result, "sources": {"schwab": "skipped", "tastytrade": "skipped"}}
+        result = call(f"{_TARGET}___{tool_name}", arguments)
+    except GatewayError as err:
+        return _unavailable(str(err))
+    if isinstance(result, dict):
+        return result
+    return {"data": result, "sources": {"schwab": "unknown", "tastytrade": "unknown"}}
 
 
 # --- tool surface ------------------------------------------------------------

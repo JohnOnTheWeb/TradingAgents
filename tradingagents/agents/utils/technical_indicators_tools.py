@@ -1,6 +1,15 @@
-from langchain_core.tools import tool
+"""LangChain ``@tool`` wrapper for technical indicators via the Gateway."""
+
+from __future__ import annotations
+
 from typing import Annotated
-from tradingagents.dataflows.interface import route_to_vendor
+
+from langchain_core.tools import tool
+
+from tradingagents.gateway_client import GatewayError, call
+
+_TARGET = "data-tools"
+
 
 @tool
 def get_indicators(
@@ -20,13 +29,22 @@ def get_indicators(
     Returns:
         str: A formatted dataframe containing the technical indicators for the specified ticker symbol and indicator.
     """
-    # LLMs sometimes pass multiple indicators as a comma-separated string;
-    # split and process each individually.
-    indicators = [i.strip().lower() for i in indicator.split(",") if i.strip()]
+    indicators = [i.strip().lower() for i in str(indicator).split(",") if i.strip()]
+    if not indicators:
+        return ""
     results = []
     for ind in indicators:
         try:
-            results.append(route_to_vendor("get_indicators", symbol, ind, curr_date, look_back_days))
-        except ValueError as e:
-            results.append(str(e))
+            r = call(
+                f"{_TARGET}___get_indicators",
+                {
+                    "symbol": symbol,
+                    "indicator": ind,
+                    "curr_date": curr_date,
+                    "look_back_days": look_back_days,
+                },
+            )
+            results.append(r if isinstance(r, str) else str(r))
+        except GatewayError as err:
+            results.append(f"[get_indicators({ind}) unavailable: {err}]")
     return "\n\n".join(results)

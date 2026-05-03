@@ -1,6 +1,17 @@
-from langchain_core.tools import tool
+"""LangChain ``@tool`` wrappers for OHLCV stock-price data.
+
+All calls flow through the AgentCore Gateway (``data-tools`` target).
+"""
+
+from __future__ import annotations
+
 from typing import Annotated
-from tradingagents.dataflows.interface import route_to_vendor
+
+from langchain_core.tools import tool
+
+from tradingagents.gateway_client import GatewayError, call
+
+_TARGET = "data-tools"
 
 
 @tool
@@ -19,4 +30,11 @@ def get_stock_data(
     Returns:
         str: A formatted dataframe containing the stock price data for the specified ticker symbol in the specified date range.
     """
-    return route_to_vendor("get_stock_data", symbol, start_date, end_date)
+    try:
+        result = call(
+            f"{_TARGET}___get_stock_data",
+            {"symbol": symbol, "start_date": start_date, "end_date": end_date},
+        )
+    except GatewayError as err:
+        return f"[get_stock_data unavailable: {err}]"
+    return result if isinstance(result, str) else str(result)

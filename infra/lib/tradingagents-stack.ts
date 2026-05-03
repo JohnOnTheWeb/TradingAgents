@@ -674,20 +674,23 @@ export class TradingAgentsStack extends cdk.Stack {
           },
           EnvironmentVariables: {
             TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
-            TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
             MD_STORE_SECRET_ID: mdStoreSecret.secretName,
             MD_STORE_AGENT_ID: "tauric-traders",
             AWS_DEFAULT_REGION: this.region,
+            AWS_REGION: this.region,
+            // All agent tool calls go through the AgentCore Gateway.
+            // BROKERAGE_MCP_URL / BROKERAGE_SHARED_SECRET_ID intentionally
+            // omitted so the direct-to-sidecar bypass cannot be used.
+            GATEWAY_URL: cdk.Lazy.string({
+              produce: () =>
+                gateway
+                  ? cdk.Fn.getAtt(gateway.logicalId, "GatewayUrl").toString()
+                  : "",
+            }),
             ...(observabilityEnvVars
               ? {
                   ...observabilityEnvVars,
                   OTEL_SERVICE_NAME: "tradingagents-runtime",
-                }
-              : {}),
-            ...(brokerageEnabled
-              ? {
-                  BROKERAGE_MCP_URL: brokerageMcpUrlToken,
-                  BROKERAGE_SHARED_SECRET_ID: "brokerage/shared-secret",
                 }
               : {}),
           },
@@ -814,6 +817,20 @@ export class TradingAgentsStack extends cdk.Stack {
                           Required: ["trade_date"],
                         },
                       },
+                      {
+                        Name: "get_returns",
+                        Description:
+                          "Realised raw + SPY-alpha returns over a holding window, for outcome resolution",
+                        InputSchema: {
+                          Type: "object",
+                          Properties: {
+                            ticker: { Type: "string" },
+                            trade_date: { Type: "string", Description: "YYYY-MM-DD" },
+                            holding_days: { Type: "integer", Description: "Trading days to hold" },
+                          },
+                          Required: ["ticker", "trade_date"],
+                        },
+                      },
                     ],
                   },
                 },
@@ -893,117 +910,9 @@ export class TradingAgentsStack extends cdk.Stack {
       memoryLogTarget.addDependency(gateway);
     }
 
-    // Brokerage-MCP Gateway target — read-only (no trading tools).
-    if (agentCoreEnabled && gateway && brokerageProxyFn) {
-      brokerageProxyFn.grantInvoke(gatewayRole);
-
-      const tickerInput = {
-        Type: "object",
-        Properties: {
-          ticker: { Type: "string", Description: "Stock ticker symbol" },
-        },
-        Required: ["ticker"],
-      };
-
-      brokerageMcpTarget = new cdk.CfnResource(this, "GatewayTargetBrokerage", {
-        type: "AWS::BedrockAgentCore::GatewayTarget",
-        properties: {
-          GatewayIdentifier: gateway.ref,
-          Name: "brokerage",
-          Description: "Read-only brokerage data (Schwab + Tastytrade) — vol regime, chains, earnings, liquidity",
-          CredentialProviderConfigurations: [
-            { CredentialProviderType: "GATEWAY_IAM_ROLE" },
-          ],
-          TargetConfiguration: {
-            Mcp: {
-              Lambda: {
-                LambdaArn: brokerageProxyFn.functionArn,
-                ToolSchema: {
-                  InlinePayload: [
-                    {
-                      Name: "get_vol_regime",
-                      Description: "IV rank/percentile, IV-HV spread, HV 30/60/90, beta, SPY corr, put/call ratio",
-                      InputSchema: tickerInput,
-                    },
-                    {
-                      Name: "get_term_structure",
-                      Description: "Implied volatility per option expiration (term structure)",
-                      InputSchema: tickerInput,
-                    },
-                    {
-                      Name: "get_options_chain",
-                      Description: "Options chain around ATM at expiration closest to dte_target with Greeks/OI",
-                      InputSchema: {
-                        Type: "object",
-                        Properties: {
-                          ticker: { Type: "string" },
-                          dte_target: { Type: "integer", Description: "Target DTE" },
-                          strikes_width: { Type: "integer", Description: "Strikes on each side of ATM" },
-                        },
-                        Required: ["ticker"],
-                      },
-                    },
-                    {
-                      Name: "get_earnings_context",
-                      Description: "Next earnings date, time-of-day, recent EPS history",
-                      InputSchema: tickerInput,
-                    },
-                    {
-                      Name: "get_liquidity",
-                      Description: "Liquidity rating, rank, borrow rate, lendability",
-                      InputSchema: tickerInput,
-                    },
-                    {
-                      Name: "get_historical_vol",
-                      Description: "Realized volatility for given lookback windows",
-                      InputSchema: {
-                        Type: "object",
-                        Properties: {
-                          ticker: { Type: "string" },
-                          windows: { Type: "array", Items: { Type: "integer" } },
-                        },
-                        Required: ["ticker"],
-                      },
-                    },
-                    {
-                      Name: "get_corporate_events",
-                      Description: "Recent dividend and earnings report history",
-                      InputSchema: tickerInput,
-                    },
-                    {
-                      Name: "get_quote",
-                      Description: "Level-1 quote: bid/ask/mid/last/spread_bps/day hi-lo",
-                      InputSchema: tickerInput,
-                    },
-                    {
-                      Name: "get_movers",
-                      Description: "Top movers for a market index; Schwab only, returns [] if unavailable",
-                      InputSchema: {
-                        Type: "object",
-                        Properties: {
-                          index: { Type: "string", Description: "$SPX, $DJI, NASDAQ, etc." },
-                          sort: { Type: "string", Description: "VOLUME | TRADES | PERCENT_CHANGE_UP | PERCENT_CHANGE_DOWN" },
-                        },
-                      },
-                    },
-                    {
-                      Name: "search_instruments",
-                      Description: "Search instruments by ticker or description",
-                      InputSchema: {
-                        Type: "object",
-                        Properties: { query: { Type: "string" } },
-                        Required: ["query"],
-                      },
-                    },
-                  ],
-                },
-              },
-            },
-          },
-        },
-      });
-      brokerageMcpTarget.addDependency(gateway);
-    }
+    // Brokerage-MCP Gateway target is defined below, after BrokerageProxyFn
+    // is created inside the brokerage-enabled block. Leaving this comment
+    // here as a breadcrumb for the original location.
 
     // ------------------------------------------------------------------
     // ECS Fargate — per-ticker invoker replaces the old ta-invoke-agent
@@ -1064,17 +973,20 @@ export class TradingAgentsStack extends cdk.Stack {
           TA_RESULT_KEY_PREFIX: "runs/",
           AGENTCORE_TIMEOUT: "3600",
           TRADINGAGENTS_MEMORY_BACKEND: "dynamodb",
-          TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
+          AWS_REGION: this.region,
+          // All agent tool calls go through the AgentCore Gateway.
+          // BROKERAGE_MCP_URL / BROKERAGE_SHARED_SECRET_ID intentionally
+          // omitted so the direct-to-sidecar bypass cannot be used.
+          GATEWAY_URL: cdk.Lazy.string({
+            produce: () =>
+              gateway
+                ? cdk.Fn.getAtt(gateway.logicalId, "GatewayUrl").toString()
+                : "",
+          }),
           ...(observabilityEnvVars
             ? {
                 ...observabilityEnvVars,
                 OTEL_SERVICE_NAME: "tradingagents-task-runner",
-              }
-            : {}),
-          ...(brokerageEnabled
-            ? {
-                BROKERAGE_MCP_URL: brokerageMcpUrlToken,
-                BROKERAGE_SHARED_SECRET_ID: "brokerage/shared-secret",
               }
             : {}),
         },
@@ -1084,6 +996,14 @@ export class TradingAgentsStack extends cdk.Stack {
       taskDef.taskRole.addToPrincipalPolicy(
         new iam.PolicyStatement({
           actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+          resources: ["*"],
+        }),
+      );
+      // All agent tool calls route through the Gateway — grant the task
+      // role InvokeGateway so its SigV4 requests are authorised.
+      taskDef.taskRole.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ["bedrock-agentcore:InvokeGateway"],
           resources: ["*"],
         }),
       );
@@ -1311,6 +1231,119 @@ export class TradingAgentsStack extends cdk.Stack {
       }
     }
 
+    // Brokerage-MCP Gateway target — read-only (no trading tools).
+    // Must come after BrokerageProxyFn is created above.
+    if (agentCoreEnabled && gateway && brokerageProxyFn) {
+      brokerageProxyFn.grantInvoke(gatewayRole);
+
+      const tickerInput = {
+        Type: "object",
+        Properties: {
+          ticker: { Type: "string", Description: "Stock ticker symbol" },
+        },
+        Required: ["ticker"],
+      };
+
+      brokerageMcpTarget = new cdk.CfnResource(this, "GatewayTargetBrokerage", {
+        type: "AWS::BedrockAgentCore::GatewayTarget",
+        properties: {
+          GatewayIdentifier: gateway.ref,
+          Name: "brokerage",
+          Description: "Read-only brokerage data (Schwab + Tastytrade) — vol regime, chains, earnings, liquidity",
+          CredentialProviderConfigurations: [
+            { CredentialProviderType: "GATEWAY_IAM_ROLE" },
+          ],
+          TargetConfiguration: {
+            Mcp: {
+              Lambda: {
+                LambdaArn: brokerageProxyFn.functionArn,
+                ToolSchema: {
+                  InlinePayload: [
+                    {
+                      Name: "get_vol_regime",
+                      Description: "IV rank/percentile, IV-HV spread, HV 30/60/90, beta, SPY corr, put/call ratio",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_term_structure",
+                      Description: "Implied volatility per option expiration (term structure)",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_options_chain",
+                      Description: "Options chain around ATM at expiration closest to dte_target with Greeks/OI",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: {
+                          ticker: { Type: "string" },
+                          dte_target: { Type: "integer", Description: "Target DTE" },
+                          strikes_width: { Type: "integer", Description: "Strikes on each side of ATM" },
+                        },
+                        Required: ["ticker"],
+                      },
+                    },
+                    {
+                      Name: "get_earnings_context",
+                      Description: "Next earnings date, time-of-day, recent EPS history",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_liquidity",
+                      Description: "Liquidity rating, rank, borrow rate, lendability",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_historical_vol",
+                      Description: "Realized volatility for given lookback windows",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: {
+                          ticker: { Type: "string" },
+                          windows: { Type: "array", Items: { Type: "integer" } },
+                        },
+                        Required: ["ticker"],
+                      },
+                    },
+                    {
+                      Name: "get_corporate_events",
+                      Description: "Recent dividend and earnings report history",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_quote",
+                      Description: "Level-1 quote: bid/ask/mid/last/spread_bps/day hi-lo",
+                      InputSchema: tickerInput,
+                    },
+                    {
+                      Name: "get_movers",
+                      Description: "Top movers for a market index; Schwab only, returns [] if unavailable",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: {
+                          index: { Type: "string", Description: "$SPX, $DJI, NASDAQ, etc." },
+                          sort: { Type: "string", Description: "VOLUME | TRADES | PERCENT_CHANGE_UP | PERCENT_CHANGE_DOWN" },
+                        },
+                      },
+                    },
+                    {
+                      Name: "search_instruments",
+                      Description: "Search instruments by ticker or description",
+                      InputSchema: {
+                        Type: "object",
+                        Properties: { query: { Type: "string" } },
+                        Required: ["query"],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      });
+      brokerageMcpTarget.addDependency(gateway);
+    }
+
     // ------------------------------------------------------------------
     // Step Functions state machine
     // ------------------------------------------------------------------
@@ -1401,13 +1434,13 @@ export class TradingAgentsStack extends cdk.Stack {
           })
         : null;
 
-    // Max concurrent Fargate tasks in the per-ticker Map. Default 3.
+    // Max concurrent Fargate tasks in the per-ticker Map. Default 15.
     // Override with `-c mapConcurrency=N` at deploy time.
     const mapConcurrencyRaw = this.node.tryGetContext("mapConcurrency");
     const mapConcurrency =
       typeof mapConcurrencyRaw === "number"
         ? mapConcurrencyRaw
-        : parseInt(String(mapConcurrencyRaw ?? "3"), 10) || 3;
+        : parseInt(String(mapConcurrencyRaw ?? "15"), 10) || 15;
 
     const tickerMap = new sfn.Map(this, "PerTickerMap", {
       maxConcurrency: mapConcurrency,
@@ -1490,10 +1523,10 @@ export class TradingAgentsStack extends cdk.Stack {
     new scheduler.CfnSchedule(this, "DailySchedule", {
       name: "tradingagents-daily",
       description:
-        "MON-FRI 18:00 ET — kick off the TradingAgents multi-ticker run",
-      scheduleExpression: "cron(0 22 ? * MON-FRI *)",
-      scheduleExpressionTimezone: "UTC",
-      state: "DISABLED", // enable manually after smoke test
+        "MON-FRI 09:00 ET — kick off the TradingAgents multi-ticker run",
+      scheduleExpression: "cron(0 9 ? * MON-FRI *)",
+      scheduleExpressionTimezone: "America/New_York",
+      state: "ENABLED",
       flexibleTimeWindow: { mode: "OFF" },
       target: {
         arn: stateMachine.stateMachineArn,

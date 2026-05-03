@@ -1,6 +1,18 @@
+"""LangChain ``@tool`` wrappers for company fundamentals via the Gateway."""
+
+from __future__ import annotations
+
+from typing import Annotated, Any
+
 from langchain_core.tools import tool
-from typing import Annotated
-from tradingagents.dataflows.interface import route_to_vendor
+
+from tradingagents.gateway_client import GatewayError, call
+
+_TARGET = "data-tools"
+
+
+def _str_result(result: Any) -> str:
+    return result if isinstance(result, str) else str(result)
 
 
 @tool
@@ -17,7 +29,12 @@ def get_fundamentals(
     Returns:
         str: A formatted report containing comprehensive fundamental data
     """
-    return route_to_vendor("get_fundamentals", ticker, curr_date)
+    try:
+        return _str_result(
+            call(f"{_TARGET}___get_fundamentals", {"ticker": ticker, "curr_date": curr_date})
+        )
+    except GatewayError as err:
+        return f"[get_fundamentals unavailable: {err}]"
 
 
 @tool
@@ -36,7 +53,15 @@ def get_balance_sheet(
     Returns:
         str: A formatted report containing balance sheet data
     """
-    return route_to_vendor("get_balance_sheet", ticker, freq, curr_date)
+    try:
+        return _str_result(
+            call(
+                f"{_TARGET}___get_balance_sheet",
+                {"ticker": ticker, "freq": freq, "curr_date": curr_date},
+            )
+        )
+    except GatewayError as err:
+        return f"[get_balance_sheet unavailable: {err}]"
 
 
 @tool
@@ -55,7 +80,15 @@ def get_cashflow(
     Returns:
         str: A formatted report containing cash flow statement data
     """
-    return route_to_vendor("get_cashflow", ticker, freq, curr_date)
+    try:
+        return _str_result(
+            call(
+                f"{_TARGET}___get_cashflow",
+                {"ticker": ticker, "freq": freq, "curr_date": curr_date},
+            )
+        )
+    except GatewayError as err:
+        return f"[get_cashflow unavailable: {err}]"
 
 
 @tool
@@ -74,4 +107,12 @@ def get_income_statement(
     Returns:
         str: A formatted report containing income statement data
     """
-    return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+    try:
+        return _str_result(
+            call(
+                f"{_TARGET}___get_income_statement",
+                {"ticker": ticker, "freq": freq, "curr_date": curr_date},
+            )
+        )
+    except GatewayError as err:
+        return f"[get_income_statement unavailable: {err}]"

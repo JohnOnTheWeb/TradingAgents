@@ -3,16 +3,19 @@
   "deep_model": "us.anthropic.claude-opus-4-7",
   "quick_model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
   "tickers": [
-    { "symbol": "AMZN", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "GOOG", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "WDC",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "BE",   "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "AMD",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "HOOD", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "LMT",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "OKTA", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "GEV",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "AVGO", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 },
-    { "symbol": "UBER", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 2 }
+    { "symbol": "AMZN", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "GOOG", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "WDC",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "BE",   "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "AMD",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "HOOD", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "LMT",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "OKTA", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "GEV",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "AVGO", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "UBER", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "WMT",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "MSFT", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "COST", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 }
   ]
 }

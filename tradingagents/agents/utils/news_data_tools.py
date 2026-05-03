@@ -1,6 +1,19 @@
+"""LangChain ``@tool`` wrappers for news data via the Gateway."""
+
+from __future__ import annotations
+
+from typing import Annotated, Any
+
 from langchain_core.tools import tool
-from typing import Annotated
-from tradingagents.dataflows.interface import route_to_vendor
+
+from tradingagents.gateway_client import GatewayError, call
+
+_TARGET = "data-tools"
+
+
+def _str_result(result: Any) -> str:
+    return result if isinstance(result, str) else str(result)
+
 
 @tool
 def get_news(
@@ -18,7 +31,16 @@ def get_news(
     Returns:
         str: A formatted string containing news data
     """
-    return route_to_vendor("get_news", ticker, start_date, end_date)
+    try:
+        return _str_result(
+            call(
+                f"{_TARGET}___get_news",
+                {"ticker": ticker, "start_date": start_date, "end_date": end_date},
+            )
+        )
+    except GatewayError as err:
+        return f"[get_news unavailable: {err}]"
+
 
 @tool
 def get_global_news(
@@ -36,7 +58,16 @@ def get_global_news(
     Returns:
         str: A formatted string containing global news data
     """
-    return route_to_vendor("get_global_news", curr_date, look_back_days, limit)
+    try:
+        return _str_result(
+            call(
+                f"{_TARGET}___get_global_news",
+                {"curr_date": curr_date, "look_back_days": look_back_days, "limit": limit},
+            )
+        )
+    except GatewayError as err:
+        return f"[get_global_news unavailable: {err}]"
+
 
 @tool
 def get_insider_transactions(
@@ -50,4 +81,9 @@ def get_insider_transactions(
     Returns:
         str: A report of insider transaction data
     """
-    return route_to_vendor("get_insider_transactions", ticker)
+    try:
+        return _str_result(
+            call(f"{_TARGET}___get_insider_transactions", {"ticker": ticker})
+        )
+    except GatewayError as err:
+        return f"[get_insider_transactions unavailable: {err}]"
