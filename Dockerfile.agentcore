@@ -26,6 +26,11 @@ RUN pip install --no-cache-dir ".[bedrock,otel]" \
         "pydantic>=2.6,<3.0" \
         "awslambdaric>=2.0,<3.0"
 
+# Assert executable bits on the builder's python binaries BEFORE the
+# copy into the final stage, so whatever transform buildx applies on
+# COPY --from= still has executable bits to copy from.
+RUN chmod a+rx /usr/local/bin/python* /opt/venv/bin/python*
+
 
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim
 
