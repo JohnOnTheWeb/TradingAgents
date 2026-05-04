@@ -561,6 +561,12 @@ export class TradingAgentsStack extends cdk.Stack {
           TRADINGAGENTS_MEMORY_TABLE: memoryTable.tableName,
           ALPHA_VANTAGE_SECRET_ID: "tradingagents/alpha-vantage-api-key",
           TOOL_CACHE_TABLE: toolCacheTable.tableName,
+          // Lambda's filesystem is read-only outside /tmp. stockstats_utils
+          // writes per-symbol yfinance CSVs under data_cache_dir; without
+          // this override the default ~/.tradingagents/cache path fails
+          // with [Errno 30] Read-only file system and every technical
+          // indicator silently returns an empty string.
+          TRADINGAGENTS_CACHE_DIR: "/tmp/ta-cache",
         },
         logRetention: logs.RetentionDays.ONE_MONTH,
       });
@@ -1503,13 +1509,13 @@ export class TradingAgentsStack extends cdk.Stack {
           })
         : null;
 
-    // Max concurrent Fargate tasks in the per-ticker Map. Default 15.
+    // Max concurrent Fargate tasks in the per-ticker Map. Default 20.
     // Override with `-c mapConcurrency=N` at deploy time.
     const mapConcurrencyRaw = this.node.tryGetContext("mapConcurrency");
     const mapConcurrency =
       typeof mapConcurrencyRaw === "number"
         ? mapConcurrencyRaw
-        : parseInt(String(mapConcurrencyRaw ?? "15"), 10) || 15;
+        : parseInt(String(mapConcurrencyRaw ?? "20"), 10) || 20;
 
     const tickerMap = new sfn.Map(this, "PerTickerMap", {
       maxConcurrency: mapConcurrency,

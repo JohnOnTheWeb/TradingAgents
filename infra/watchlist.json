@@ -16,6 +16,7 @@
     { "symbol": "UBER", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
     { "symbol": "WMT",  "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
     { "symbol": "MSFT", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
-    { "symbol": "COST", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 }
+    { "symbol": "COST", "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 },
+    { "symbol": "MU",   "analysts": ["market", "social", "news", "fundamentals"], "debate_rounds": 5 }
   ]
 }

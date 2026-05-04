@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -159,6 +160,117 @@ def _strip_investment_thesis(text: str) -> str:
     return stripped
 
 
+def _collapse_pm_header_fields(text: str) -> str:
+    """Combine the PM decision's Rating, Price Target, and Time Horizon
+    fields into a single inline header line."""
+    if not text:
+        return text
+    field_pat = re.compile(
+        r"(?m)^\*\*(Rating|Price Target|Time Horizon)\*\*:\s*([^\n]+)\s*$"
+    )
+    found: Dict[str, str] = {}
+    positions: List[tuple] = []
+    for m in field_pat.finditer(text):
+        name, value = m.group(1), m.group(2).strip()
+        found.setdefault(name, value)
+        positions.append((m.start(), m.end()))
+    if not positions:
+        return text
+    # Remove all matched lines (walk in reverse so offsets stay valid).
+    out = text
+    for start, end in reversed(positions):
+        out = out[:start] + out[end:]
+    out = re.sub(r"\n{3,}", "\n\n", out).lstrip("\n")
+    parts = [
+        f"**{k}**: {found[k]}"
+        for k in ("Rating", "Price Target", "Time Horizon")
+        if k in found
+    ]
+    header = "  |  ".join(parts)
+    return f"{header}\n\n{out}".rstrip() + "\n"
+
+
+def _tighten_paragraphs(text: str) -> str:
+    """Replace paragraph breaks (blank lines) with Markdown hard line breaks
+    so prose renders at roughly half the vertical spacing. Blank lines
+    adjacent to headings, list items, table rows, and code fences are left
+    alone so structural blocks still separate properly."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == "" and out and i + 1 < len(lines):
+            prev = out[-1].strip()
+            nxt = lines[i + 1].strip()
+            structural = lambda s: (
+                not s
+                or s.startswith(("#", ">", "- ", "* ", "|", "```", "~~~"))
+                or bool(re.match(r"^\d+\.\s", s))
+            )
+            if structural(prev) or structural(nxt):
+                out.append(line)
+            else:
+                # Collapse the blank line: append two trailing spaces to the
+                # previous line to make a hard break, then drop the blank.
+                if not out[-1].endswith("  "):
+                    out[-1] = out[-1].rstrip() + "  "
+        else:
+            out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _demote_markdown_headings(text: str, shift: int = 1) -> str:
+    """Bump all ATX heading levels in ``text`` by ``shift`` so they nest
+    cleanly under the summary's section heading."""
+    if not text or shift <= 0:
+        return text
+    return re.sub(
+        r"(?m)^(#{1,6}) ",
+        lambda m: "#" * min(6, len(m.group(1)) + shift) + " ",
+        text,
+    )
+
+
+_MARKET_CONCL_HEADING = re.compile(
+    r"(?m)^## +(.*(?:conclusion|final (?:verdict|thoughts|recommendation"
+    r"|conviction|synthesis|transaction)|bottom line).*)$",
+    re.I,
+)
+
+
+def _extract_market_conclusion(market_report: str) -> str:
+    """Pull the trailing conclusion section out of a market analyst report.
+
+    The market prompt doesn't mandate a heading name, so we keyword-match on
+    the last H2 that looks conclusion-like (``Conclusion``, ``Final X``,
+    ``Bottom Line``, ``FINAL TRANSACTION PROPOSAL``). Falls back to the last
+    H2 in the document if nothing matches.
+
+    Trims at the first line-starting ``---`` horizontal rule AFTER the heading
+    so trailing disclaimers and Summary/Metrics tables following the
+    conclusion don't bleed in.
+    """
+    if not market_report:
+        return ""
+    matches = list(_MARKET_CONCL_HEADING.finditer(market_report))
+    if matches:
+        start = matches[-1].start()
+    else:
+        h2s = list(re.finditer(r"(?m)^## (.+)$", market_report))
+        start = h2s[-1].start() if h2s else max(0, len(market_report) - 1500)
+    body = market_report[start:]
+    nl = body.find("\n")
+    search_from = nl + 1 if nl >= 0 else 0
+    hr = re.search(r"(?m)^---\s*$", body[search_from:])
+    if hr:
+        body = body[: search_from + hr.start()]
+    return body.rstrip()
+
+
 def _render_summary(
     trade_date: str, run_id: str, results: Iterable[Dict[str, Any]]
 ) -> str:
@@ -211,9 +323,22 @@ def _render_summary(
         full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
         short = str(r.get("decision", "") or "").strip()
         body = _strip_investment_thesis(full) if full else short
+        body = _collapse_pm_header_fields(body).rstrip()
+        market_report = str(
+            (r.get("final_state") or {}).get("market_report") or ""
+        )
+        market_concl = _extract_market_conclusion(market_report)
         lines.append(f"### {ticker}")
         lines.append("")
-        lines.append(body or "_no decision returned_")
+        lines.append(_tighten_paragraphs(body) if body else "_no decision returned_")
+        if market_concl:
+            # Strip the section's leading H2 heading line ("## Conclusion" /
+            # "## Final Thoughts" / etc.) so only the prose body appears
+            # beneath the PM block. No sub-heading is inserted — per request.
+            stripped = re.sub(r"^##\s+[^\n]*\n+", "", market_concl, count=1)
+            stripped = _demote_markdown_headings(stripped, shift=3)
+            lines.append("")
+            lines.append(_tighten_paragraphs(stripped.rstrip()))
         lines.append("")
 
     if failures:
@@ -265,8 +390,21 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
             ticker = str(r.get("ticker", "?")).upper()
             full = str((r.get("final_state") or {}).get("final_trade_decision") or "").strip()
             short = str(r.get("decision", "") or "").strip()
-            body_text = (_strip_investment_thesis(full) if full else short) or "(no decision)"
-            conclusion_blocks.append(f"=== {ticker} ===\n{body_text}")
+            pm_text = (_strip_investment_thesis(full) if full else short) or "(no decision)"
+            pm_text = _collapse_pm_header_fields(pm_text)
+            market_report = str(
+                (r.get("final_state") or {}).get("market_report") or ""
+            )
+            market_text = _extract_market_conclusion(market_report)
+            if market_text:
+                # Drop the leading H2 heading so the market block reads as prose.
+                market_text = re.sub(
+                    r"^##\s+[^\n]*\n+", "", market_text, count=1
+                )
+            block = f"=== {ticker} ===\n{pm_text}"
+            if market_text:
+                block += f"\n{market_text}"
+            conclusion_blocks.append(block)
         body = (
             f"TradingAgents run {run_id}\n"
             f"Date: {trade_date}\n"
